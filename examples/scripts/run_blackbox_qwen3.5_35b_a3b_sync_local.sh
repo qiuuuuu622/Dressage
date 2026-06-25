@@ -14,6 +14,7 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
+export NCCL_NVLS_ENABLE=0
 
 # unset proxy to avoid distributed startup issues
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
@@ -21,7 +22,10 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SLIME_ROOT="${SLIME_ROOT:-${REPO_ROOT}/slime}"
-BASE_FOLDER="${BASE_FOLDER:-/root}"
+
+# Auto-apply SGLang CUDA graph recapture patch (fixes rollout-after-weight-update garbling)
+bash "${REPO_ROOT}/patches/apply_cudagraph_patch.sh" || true
+BASE_FOLDER="${BASE_FOLDER:-/root/model_dist}"
 
 if [[ ! -f "${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh" ]]; then
   echo "Cannot find slime model config: ${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh" >&2
@@ -61,7 +65,7 @@ source "${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"
 source "${SCRIPT_DIR}/default/dressage_env_defaults.sh"
 
 dressage_apply_common_defaults "qwen3.5-35B-A3B-sync-local" "blackbox" "local_bwrap"
-dressage_apply_local_bwrap_defaults 8
+dressage_apply_local_bwrap_defaults 256
 
 if [[ "${DRESSAGE_BLACKBOX_RUNNER_MODE}" == "bwrap" || "${DRESSAGE_BLACKBOX_RUNNER_MODE}" == "bubblewrap" ]]; then
   command -v "${DRESSAGE_BLACKBOX_BWRAP_BIN}" >/dev/null || {
@@ -86,7 +90,7 @@ fi
 export PYTHONPATH="${REPO_ROOT}:${SLIME_ROOT}:${PYTHONPATH:-}"
 dressage_export_common_env
 dressage_export_local_bwrap_env
-dressage_compute_context_window 8192 "${CP_SIZE}"
+dressage_compute_context_window 6144 "${CP_SIZE}"   # MTP 训练加层+额外词表投影,降 token 预算给 GPU0(head rank)留余量
 
 COMM_ARGS=(
    --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
@@ -105,9 +109,9 @@ PROXY_ARGS=(
 
 CKPT_ARGS=(
    --hf-checkpoint "${BASE_FOLDER}/Qwen3.5-35B-A3B"
-   --ref-load "${BASE_FOLDER}/Qwen3.5-35B-A3B_torch_dist"
-   --load "${BASE_FOLDER}/Qwen3.5-35B-A3B_slime/"
-   --save "${BASE_FOLDER}/Qwen3.5-35B-A3B_slime/"
+   --ref-load "${BASE_FOLDER}/Qwen3.5-35B-A3B_torch_dist_mtp"
+   --load "${BASE_FOLDER}/Qwen3.5-35B-A3B_slime_mtp/"
+   --save "${BASE_FOLDER}/Qwen3.5-35B-A3B_slime_mtp/"
    --save-interval 20
    --no-save-optim
    --no-load-optim
@@ -128,10 +132,10 @@ ROLLOUT_ARGS=(
    --metadata-key metadata
    --rollout-shuffle
    --num-rollout 128
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-8}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-64}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
-   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
-   --global-batch-size "${GLOBAL_BATCH_SIZE:-64}"
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-10240}"
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-48}"
    --balance-data
    --rollout-global-dataset
 )
@@ -157,13 +161,15 @@ PERF_ARGS=(
    --calculate-per-token-loss
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
 
-   --log-probs-chunk-size 1024
+   --log-probs-chunk-size 512
+   --enable-mtp-training
+   --mtp-loss-scaling-factor 0.1
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.00
+   --kl-loss-coef 1e-3 
    --kl-loss-type low_var_kl
    --kl-coef 0.00
    --entropy-coef 0.00
@@ -183,23 +189,29 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3.5-35B-A3B-dressage
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-dev
+   --wandb-group qwen3.5-35B-A3B-mtp-eagle
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.6
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static 0.75
+   --sglang-disable-custom-all-reduce
    --sglang-reasoning-parser qwen3
    --sglang-tool-call-parser qwen3_coder
    --sglang-log-level warning
    --sglang-chunked-prefill-size 4096
-   --sglang-max-prefill-tokens 8192
-   --sglang-max-running-requests 64
+   --sglang-max-prefill-tokens 16384
+   --sglang-max-running-requests 256
    --sglang-router-port "${SGLANG_ROUTER_PORT}"
-   --router-policy consistent_hashing
+   --router-policy round_robin
+   --sglang-speculative-algorithm EAGLE
+   --sglang-speculative-num-steps 2
+   --sglang-speculative-eagle-topk 1
+   --sglang-speculative-num-draft-tokens 3
+   --sglang-mamba-scheduler-strategy extra_buffer
+   --sglang-enable-metrics
 )
 
 MISC_ARGS=(
@@ -208,9 +220,8 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-
-#    --moe-token-dispatcher-type flex
-#    --moe-enable-deepep
+   --moe-token-dispatcher-type flex
+   --moe-enable-deepep
 )
 
 if [[ -f "${PROXY_PID_FILE}" ]]; then
@@ -311,6 +322,10 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "MASTER_ADDR": "${MASTER_ADDR}",
     "PYTHONPATH": "/root/Megatron-LM/:${REPO_ROOT}:${SLIME_ROOT}",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NVTE_FUSED_ATTN": "0",
+    "NVTE_FLASH_ATTN": "1",
+    "DRESSAGE_TAIL_BATCH": "${DRESSAGE_TAIL_BATCH:-0}",
+    "DRESSAGE_TAIL_BATCH_HISTORY": "${DRESSAGE_TAIL_BATCH_HISTORY:-/root/model_dist/tail_batch_len_hist.json}",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "DRESSAGE_PROXY_URL": "${DRESSAGE_PROXY_URL}",
     "DRESSAGE_PADDOCK_MODE": "${DRESSAGE_PADDOCK_MODE}",

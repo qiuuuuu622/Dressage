@@ -1,0 +1,35 @@
+diff --git a/python/sglang/srt/managers/scheduler_update_weights_mixin.py b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+index 534d1b2..e717b02 100644
+--- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -103,6 +103,7 @@ class SchedulerUpdateWeightsMixin:
+         success, message = worker.update_weights_from_tensor(recv_req)
+         if success:
+             self.flush_cache_after_weight_update(recv_req)
++            self._cuda_graphs_need_recapture = True
+         else:
+             logger.error(message)
+         torch.distributed.barrier(group=self.tp_cpu_group)
+@@ -209,6 +210,22 @@ class SchedulerUpdateWeightsMixin:
+                 if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                     self.disagg_prefill_bootstrap_queue.resume_memory_occupation()
+ 
++        if (
++            getattr(self, "_cuda_graphs_need_recapture", False)
++            and GPU_MEMORY_TYPE_CUDA_GRAPH in tags
++        ):
++            self.tp_worker.model_runner.init_device_graphs()
++            if self.draft_worker is not None:
++                # Spec-v2 workers (e.g. EAGLEWorkerV2) have no .model_runner;
++                # the draft ModelRunner is exposed as .draft_runner. Fall back to
++                # it so colocate onload (init_device_graphs) works with MTP/EAGLE.
++                _draft_mr = getattr(self.draft_worker, "model_runner", None) or getattr(
++                    self.draft_worker, "draft_runner", None
++                )
++                if _draft_mr is not None:
++                    _draft_mr.init_device_graphs()
++            self._cuda_graphs_need_recapture = False
++
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
