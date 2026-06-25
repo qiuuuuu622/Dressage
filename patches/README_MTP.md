@@ -40,6 +40,14 @@ slime(#1702)的 Qwen3.5 MTP bridge 期望 MTP MoE experts 是 **individual**
     #    slime 转换的 --hf-checkpoint 指向 *_mtp_individual
     #    -> 产出 Qwen3.5-35B-A3B_torch_dist_mtp(含 540 个 MTP key,bit-exact)
 
+## 3. slime MTP 模型补丁(submodule,无法直接提交)
+**文件**: `slime_mtp_model_args.patch` + `apply_slime_mtp_patch.sh`
+**目标**: `<slime>/scripts/models/qwen3.5-35B-A3B.sh`
+
+slime 是 submodule(THUDM/slime),其改动无法提进 Dressage 库,故以补丁自愈:
+给 MODEL_ARGS 加 `--mtp-num-layers 1`(开启 Megatron MTP 层)。
+run 脚本启动期自动 `bash apply_slime_mtp_patch.sh`(幂等,已应用则 skip)。
+
 ## 训练脚本里的 MTP 开关(参考)
 - **训练 loss**: `--enable-mtp-training` + `--mtp-loss-scaling-factor 0.1`;
   模型 sh 里 `--mtp-num-layers 1`;`--ref-load .../Qwen3.5-35B-A3B_torch_dist_mtp`。

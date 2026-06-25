@@ -25,6 +25,8 @@ SLIME_ROOT="${SLIME_ROOT:-${REPO_ROOT}/slime}"
 
 # Auto-apply SGLang CUDA graph recapture patch (fixes rollout-after-weight-update garbling)
 bash "${REPO_ROOT}/patches/apply_cudagraph_patch.sh" || true
+# Auto-apply slime MTP model-args patch (adds --mtp-num-layers 1; slime 是 submodule 无法直接提交)
+bash "${REPO_ROOT}/patches/apply_slime_mtp_patch.sh" || true
 BASE_FOLDER="${BASE_FOLDER:-/root/model_dist}"
 
 if [[ ! -f "${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh" ]]; then

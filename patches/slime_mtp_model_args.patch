@@ -1,0 +1,12 @@
+diff --git a/scripts/models/qwen3.5-35B-A3B.sh b/scripts/models/qwen3.5-35B-A3B.sh
+index c3cb7219..8d623a3c 100644
+--- a/scripts/models/qwen3.5-35B-A3B.sh
++++ b/scripts/models/qwen3.5-35B-A3B.sh
+@@ -55,4 +55,7 @@ MODEL_ARGS=(
+    # qwen3.5 specific
+    --attention-output-gate
+    --moe-shared-expert-gate
++
++   # MTP (multi-token prediction)
++   --mtp-num-layers 1
+ )
