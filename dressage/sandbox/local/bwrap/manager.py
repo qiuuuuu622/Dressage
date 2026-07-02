@@ -520,11 +520,14 @@ class LocalBwrapClusterManagerCore:
 
     async def status(self, *, force_refresh: bool = False) -> dict[str, Any]:
         self._reap_background_tasks()
+        if force_refresh:
+            await self._refresh_nodes_outside_lock(force=True)
         async with self._lock:
             if self._closed:
                 return self._status_locked()
             await self._reconcile_locked()
-            await self._refresh_nodes_if_needed_locked(force=force_refresh)
+            if not force_refresh:
+                await self._refresh_nodes_if_needed_locked(force=False)
             return self._status_locked()
 
     async def reconcile(self) -> dict[str, Any]:
@@ -788,9 +791,46 @@ class LocalBwrapClusterManagerCore:
             await self._refresh_node(node)
         self._last_refresh_ts = time.time()
 
+    async def _refresh_nodes_outside_lock(self, *, force: bool) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            if not force:
+                elapsed = time.time() - self._last_refresh_ts
+                if elapsed < self.status_refresh_interval_sec:
+                    return
+            nodes = list(self.nodes.values())
+
+        results = await asyncio.gather(
+            *(self._refresh_node_payload(node) for node in nodes),
+            return_exceptions=True,
+        )
+
+        async with self._lock:
+            if self._closed:
+                return
+            for node, result in zip(nodes, results, strict=False):
+                current = self.nodes.get(node.node_id)
+                if current is None:
+                    continue
+                if isinstance(result, BaseException):
+                    current.mark_lost(result)
+                    for lease in self.leases.values():
+                        if lease.node_id == current.node_id and lease.status in {
+                            LEASE_ACTIVE,
+                            LEASE_RELEASING,
+                        }:
+                            lease.status = LEASE_LOST
+                    continue
+                current.update_from_health(result)
+            self._last_refresh_ts = time.time()
+
+    async def _refresh_node_payload(self, node: NodeRecord) -> dict[str, Any]:
+        return await _remote_call(node.supervisor, "health")
+
     async def _refresh_node(self, node: NodeRecord) -> dict[str, Any] | None:
         try:
-            payload = await _remote_call(node.supervisor, "health")
+            payload = await self._refresh_node_payload(node)
         except Exception as exc:
             node.mark_lost(exc)
             for lease in self.leases.values():
