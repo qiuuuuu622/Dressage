@@ -269,6 +269,49 @@ async def _run_node_supervisor_limits_concurrent_resets(tmp_path):
     await supervisor.shutdown()
 
 
+def test_node_supervisor_reports_reset_phase_profile(tmp_path):
+    asyncio.run(_run_node_supervisor_reports_reset_phase_profile(tmp_path))
+
+
+async def _run_node_supervisor_reports_reset_phase_profile(tmp_path):
+    runner = FakeRunner()
+    supervisor = LocalBwrapNodeSupervisorCore(
+        node_id="node-a",
+        node_ip="10.0.0.12",
+        capacity=1,
+        base_port=31000,
+        base_dir=tmp_path,
+        runner=runner,
+        health_checker=lambda url: True,
+        reset_strategy="hard",
+        start_health_loop=False,
+    )
+
+    await supervisor.start_pool()
+    lease = await supervisor.acquire("traj-profile")
+    await supervisor.release(
+        lease_id=lease["lease_id"],
+        trajectory_id="traj-profile",
+        reason="test",
+    )
+    for _ in range(20):
+        status = await supervisor.health()
+        if status["ready"] == 1 and status["leased"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("profiled reset did not complete")
+
+    profile = status["profile"]
+    assert profile["reset.completed.count"] >= 1
+    assert profile["reset.queue_wait.max"] >= 0
+    assert profile["reset.runner_stop.max"] >= 0
+    assert profile["reset.reset_dirs.max"] >= 0
+    assert profile["reset.runner_start.max"] >= 0
+    assert profile["reset.healthcheck.max"] >= 0
+    await supervisor.shutdown()
+
+
 def test_node_supervisor_reports_logs_when_process_exits(tmp_path):
     asyncio.run(_run_node_supervisor_reports_logs_when_process_exits(tmp_path))
 

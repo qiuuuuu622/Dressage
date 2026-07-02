@@ -204,6 +204,7 @@ class LocalBwrapNodeSupervisorCore:
             slot.config.slot_id: asyncio.Lock() for slot in self._slots
         }
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._profile_values: dict[str, list[float]] = {}
         self._run_id = f"{_safe_name(self.node_id)}-{uuid.uuid4().hex}"
         self._closed = False
         self._health_task: asyncio.Task[Any] | None = None
@@ -392,8 +393,31 @@ class LocalBwrapNodeSupervisorCore:
             "background_tasks": len(self._background_tasks),
             "reset_concurrency": self.reset_concurrency,
             "slots": [slot.to_dict() for slot in self._slots],
+            "profile": self._profile_summary(),
             "last_error": self._last_error(),
         }
+
+    def _profile_observe(self, key: str, value: float) -> None:
+        values = self._profile_values.setdefault(key, [])
+        values.append(float(value))
+        if len(values) > 2048:
+            del values[: len(values) - 2048]
+
+    def _profile_summary(self) -> dict[str, float]:
+        result: dict[str, float] = {}
+        for key, values in self._profile_values.items():
+            if not values:
+                continue
+            ordered = sorted(values)
+            p95_index = min(
+                len(ordered) - 1,
+                int(round((len(ordered) - 1) * 0.95)),
+            )
+            result[f"{key}.count"] = float(len(ordered))
+            result[f"{key}.mean"] = float(sum(ordered) / len(ordered))
+            result[f"{key}.p95"] = float(ordered[p95_index])
+            result[f"{key}.max"] = float(ordered[-1])
+        return result
 
     async def drain(self) -> dict[str, Any]:
         return {"node_id": self.node_id, "draining": True}
@@ -573,7 +597,12 @@ class LocalBwrapNodeSupervisorCore:
             )
             slot.status = SLOT_READY
 
-    async def _start_slot(self, slot: SlotRuntime) -> None:
+    async def _start_slot(
+        self,
+        slot: SlotRuntime,
+        *,
+        profile_prefix: str | None = None,
+    ) -> None:
         if self.pool_mode == POOL_COMMAND_ONLY:
             await self._prepare_command_only_slot(slot, "start_slot")
             return
@@ -588,7 +617,13 @@ class LocalBwrapNodeSupervisorCore:
         slot.last_error = None
         slot.config.clear_runtime_dirs()
         try:
+            runner_start = time.perf_counter()
             proc = await self.runner.start(slot)
+            if profile_prefix is not None:
+                self._profile_observe(
+                    f"{profile_prefix}.runner_start",
+                    time.perf_counter() - runner_start,
+                )
             slot.process = proc
             slot.process_pid = getattr(proc, "pid", None)
             if self._closed:
@@ -597,7 +632,15 @@ class LocalBwrapNodeSupervisorCore:
                 slot.process_pid = None
                 slot.status = SLOT_EMPTY
                 return
-            await self._wait_until_healthy(slot)
+            health_start = time.perf_counter()
+            try:
+                await self._wait_until_healthy(slot)
+            finally:
+                if profile_prefix is not None:
+                    self._profile_observe(
+                        f"{profile_prefix}.healthcheck",
+                        time.perf_counter() - health_start,
+                    )
             if self._closed:
                 await self.runner.stop(slot)
                 slot.process = None
@@ -624,7 +667,9 @@ class LocalBwrapNodeSupervisorCore:
         session_id: str | None = None,
         lease_id: str | None = None,
     ) -> None:
+        queued_at = time.perf_counter()
         async with self._reset_semaphore:
+            self._profile_observe("reset.queue_wait", time.perf_counter() - queued_at)
             await self._reset_slot(
                 slot,
                 reason,
@@ -709,7 +754,9 @@ class LocalBwrapNodeSupervisorCore:
                 slot.last_error = None
                 return
             slot.status = SLOT_RESTARTING
+            stop_start = time.perf_counter()
             await self.runner.stop(slot)
+            self._profile_observe("reset.runner_stop", time.perf_counter() - stop_start)
             slot.process = None
             slot.process_pid = None
             if self._closed:
@@ -728,6 +775,7 @@ class LocalBwrapNodeSupervisorCore:
                     slot.generation,
                 )
                 return
+            reset_dirs_start = time.perf_counter()
             archive_path = slot.config.reset_runtime_dirs(
                 preserve_artifacts=self.preserve_session_artifacts,
                 session_id=session_id,
@@ -738,6 +786,10 @@ class LocalBwrapNodeSupervisorCore:
                 archive_max_per_slot=self.session_archive_max_per_slot,
                 archive_ttl_sec=self.session_archive_ttl_sec,
                 metadata={"node_id": self.node_id, "node_ip": self.node_ip},
+            )
+            self._profile_observe(
+                "reset.reset_dirs",
+                time.perf_counter() - reset_dirs_start,
             )
             if archive_path is not None:
                 logger.info(
@@ -751,7 +803,9 @@ class LocalBwrapNodeSupervisorCore:
             if self._closed:
                 slot.status = SLOT_EMPTY
                 return
-            await self._start_slot(slot)
+            await self._start_slot(slot, profile_prefix="reset")
+            if slot.status == SLOT_READY:
+                self._profile_observe("reset.completed", 1.0)
 
     async def _abort_blackbox_session(self, slot: SlotRuntime, session_id: str | None) -> None:
         """Force the slot's blackbox server to abort ``session_id`` so a soft reset leaves
