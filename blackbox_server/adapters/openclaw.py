@@ -40,7 +40,10 @@ from blackbox_server.core.models import (
     TurnUsage,
     utcnow,
 )
-from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
+from blackbox_server.proxy.rollout_llm_proxy import (
+    RolloutLLMProxy,
+    rollout_proxy_health_matches,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -753,7 +756,10 @@ class OpenClawAdapter(BackendAdapter):
                         f"http://127.0.0.1:{self._proxy_port}/__proxy_health",
                         timeout=0.5,
                     )
-                    if response.status_code == 200:
+                    expected_token = (
+                        self._proxy.health_token if self._proxy is not None else None
+                    )
+                    if rollout_proxy_health_matches(response, expected_token):
                         return
             except httpx.HTTPError:
                 pass

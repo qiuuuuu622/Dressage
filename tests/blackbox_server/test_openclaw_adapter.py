@@ -14,6 +14,7 @@ import blackbox_server.adapters.openclaw as openclaw_module
 from blackbox_server.adapters.base import (
     BackendContextOverflowError,
     BackendMaxStepsExceededError,
+    BackendProcessError,
     BackendProtocolError,
 )
 from blackbox_server.adapters.openclaw import (
@@ -283,6 +284,38 @@ def test_start_proxy_passes_limits_and_default_temperature_to_rollout_proxy(
     assert captured["sticky_header_name"] == "X-SMG-Routing-Key"
     assert captured["max_steps"] == 7
     assert captured["default_temperature"] == 0.25
+
+
+def test_wait_for_proxy_rejects_stale_health_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProxy:
+        health_token = "current-token"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, timeout: float):
+            return httpx.Response(
+                200, json={"ok": True, "health_token": "stale-token"}
+            )
+
+    adapter = OpenClawAdapter()
+    adapter._proxy_port = 4567
+    adapter._proxy = FakeProxy()
+    monkeypatch.setattr(
+        openclaw_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient()
+    )
+
+    async def run_test() -> None:
+        with pytest.raises(
+            BackendProcessError, match="Timed out waiting for rollout proxy startup"
+        ):
+            await adapter._wait_for_proxy(timeout=0.001)
+
+    asyncio.run(run_test())
 
 
 def test_build_openclaw_config_maps_compaction_options(tmp_path: Path) -> None:

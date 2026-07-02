@@ -614,6 +614,38 @@ def test_start_proxy_retries_when_proxy_port_bind_fails(
     assert (runtime_dir / "run" / "proxy.port").read_text(encoding="utf-8") == "2222"
 
 
+def test_wait_for_proxy_rejects_stale_health_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProxy:
+        health_token = "current-token"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, timeout: float):
+            return httpx.Response(
+                200, json={"ok": True, "health_token": "stale-token"}
+            )
+
+    adapter = OpencodeAdapter()
+    adapter._proxy_port = 4567
+    adapter._proxy = FakeProxy()
+    monkeypatch.setattr(
+        opencode_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient()
+    )
+
+    async def run_test() -> None:
+        with pytest.raises(
+            BackendProcessError, match="Timed out waiting for rollout proxy startup"
+        ):
+            await adapter._wait_for_proxy(timeout=0.001)
+
+    asyncio.run(run_test())
+
+
 def test_start_backend_process_retries_when_opencode_health_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -6,7 +6,10 @@ from typing import Any
 
 import httpx
 
-from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
+from blackbox_server.proxy.rollout_llm_proxy import (
+    RolloutLLMProxy,
+    rollout_proxy_health_matches,
+)
 
 
 class MockAsyncByteStream(httpx.AsyncByteStream):
@@ -36,6 +39,26 @@ def _make_proxy(
         max_steps=max_steps,
         default_temperature=default_temperature,
     )
+
+
+def test_rollout_proxy_health_token_identifies_current_proxy():
+    proxy = _make_proxy()
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.get("/__proxy_health")
+
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["health_token"] == proxy.health_token
+        assert rollout_proxy_health_matches(response, proxy.health_token) is True
+        assert rollout_proxy_health_matches(response, "stale-token") is False
+        assert proxy.health_token != _make_proxy().health_token
+
+    asyncio.run(run_test())
 
 
 def _sse_event(payload: dict[str, Any]) -> bytes:

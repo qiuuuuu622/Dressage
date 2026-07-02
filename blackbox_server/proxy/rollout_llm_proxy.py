@@ -7,6 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request
@@ -16,11 +17,25 @@ from blackbox_server.core.models import DEFAULT_PROXY_MAX_STEPS
 
 
 LOGGER = logging.getLogger(__name__)
+_HEALTH_TOKEN_FIELD = "health_token"
 
 DRESSAGE_ROLLOUT_INVALIDATED_ERRORS = {
     "generation_preempted",
     "trajectory_version_changed",
 }
+
+
+def rollout_proxy_health_matches(
+    response: httpx.Response,
+    expected_token: str | None,
+) -> bool:
+    if response.status_code != 200 or not expected_token:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get(_HEALTH_TOKEN_FIELD) == expected_token
 
 
 @dataclass
@@ -131,11 +146,16 @@ class RolloutLLMProxy:
         self._pause_state_changed = asyncio.Event()
         self._pause_started_at: float | None = None
         self._total_paused_seconds = 0.0
+        self._health_token = uuid4().hex
         self._app = self._build_app()
 
     @property
     def app(self) -> FastAPI:
         return self._app
+
+    @property
+    def health_token(self) -> str:
+        return self._health_token
 
     async def open_turn(self, turn_id: str, backend_session_id: str | None = None) -> None:
         async with self._scope_lock:
@@ -441,8 +461,8 @@ class RolloutLLMProxy:
         app = FastAPI(lifespan=_lifespan)
 
         @app.get("/__proxy_health")
-        async def _health() -> dict[str, bool]:
-            return {"ok": True}
+        async def _health() -> dict[str, object]:
+            return {"ok": True, _HEALTH_TOKEN_FIELD: self._health_token}
 
         @app.api_route(
             "/{path:path}",

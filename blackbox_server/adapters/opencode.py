@@ -40,7 +40,10 @@ from blackbox_server.core.models import (
     utcnow,
 )
 from blackbox_server.core.profiling import ProfileRecorder
-from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
+from blackbox_server.proxy.rollout_llm_proxy import (
+    RolloutLLMProxy,
+    rollout_proxy_health_matches,
+)
 
 _OC_MSG_COUNT_KEY = "__bbs_opencode_msg_count"
 _MAX_STEPS_EXCEEDED_ERROR_CODE = "max_steps_exceeded"
@@ -507,7 +510,10 @@ class OpencodeAdapter(BackendAdapter):
                         f"http://127.0.0.1:{self._proxy_port}/__proxy_health",
                         timeout=0.5,
                     )
-                    if response.status_code == 200:
+                    expected_token = (
+                        self._proxy.health_token if self._proxy is not None else None
+                    )
+                    if rollout_proxy_health_matches(response, expected_token):
                         return
             except httpx.HTTPError:
                 pass
