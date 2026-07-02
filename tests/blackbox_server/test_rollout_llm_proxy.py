@@ -157,6 +157,66 @@ def test_rollout_proxy_preserves_stream_options_without_logprob_injection():
     asyncio.run(run_test())
 
 
+def test_rollout_proxy_records_stream_usage_profile():
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    _sse_event({"id": "resp-1", "choices": [{"delta": {"content": "ok"}}]}),
+                    _sse_event(
+                        {
+                            "id": "resp-1",
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 2,
+                                "total_tokens": 5,
+                                "profile": {
+                                    "chat.total_s": 1.25,
+                                    "chat.generation_s": 1.0,
+                                    "sglang.client_generate_post_s": 0.75,
+                                },
+                            },
+                        }
+                    ),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="oc-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "gpt-test", "messages": [], "stream": True},
+            ) as response:
+                await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        profile = await proxy.turn_profile()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert profile["proxy.llm_prompt_tokens"] == 3.0
+        assert profile["proxy.llm_completion_tokens"] == 2.0
+        assert profile["proxy.llm_total_tokens"] == 5.0
+        assert profile["proxy.llm_chat_total_s"] == 1.25
+        assert profile["proxy.llm_chat_generation_s"] == 1.0
+        assert profile["proxy.llm_sglang_client_generate_post_s"] == 0.75
+
+    asyncio.run(run_test())
+
+
 def test_rollout_proxy_does_not_inject_logprobs_for_non_stream_requests():
     proxy = _make_proxy()
     requests: list[dict[str, object]] = []

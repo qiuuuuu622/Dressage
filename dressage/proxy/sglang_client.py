@@ -11,6 +11,11 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 import httpx
 
 
+def _profile_add(profile: dict[str, Any] | None, key: str, seconds: float) -> None:
+    if profile is not None:
+        profile[key] = float(profile.get(key, 0.0)) + float(seconds)
+
+
 def _coerce_int_list(values: Any) -> list[int]:
     if not isinstance(values, list):
         return []
@@ -183,7 +188,9 @@ class SGLangRouterClient:
         return_routed_experts: bool = False,
         routing_key: str | None = None,
         request_id: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> SGLangResponse:
+        started = time.perf_counter()
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
@@ -201,17 +208,25 @@ class SGLangRouterClient:
         headers = {}
         if routing_key:
             headers["X-SMG-Routing-Key"] = routing_key
+        _profile_add(profile, "sglang.client_generate_request_build_s", time.perf_counter() - started)
 
+        post_started = time.perf_counter()
         response = await self._client.post(
             f"{self._router_url}/generate", json=payload, headers=headers
         )
+        _profile_add(profile, "sglang.client_generate_post_s", time.perf_counter() - post_started)
         response.raise_for_status()
+        json_started = time.perf_counter()
         data = response.json()
-        return self._coerce_response(
+        _profile_add(profile, "sglang.client_generate_json_parse_s", time.perf_counter() - json_started)
+        coerce_started = time.perf_counter()
+        result = self._coerce_response(
             data,
             input_ids=input_ids,
             expect_input_logprobs=bool(return_logprob and logprob_start_len == 0),
         )
+        _profile_add(profile, "sglang.client_generate_coerce_s", time.perf_counter() - coerce_started)
+        return result
 
     async def abort_request(
         self,

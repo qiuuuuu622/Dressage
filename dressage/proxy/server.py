@@ -24,6 +24,7 @@ from dressage.config import (
     sglang_router_url as default_sglang_router_url,
     trajectory_build_defaults,
 )
+from dressage.profiling import enabled as profiling_enabled
 
 from .generation_controller import (
     GenerationController,
@@ -52,6 +53,24 @@ logger = logging.getLogger(__name__)
 _INPUT_TOKEN_VERSION = "-1"
 _DEFAULT_TOOL_CALL_PARSER = object()
 _NON_REAL_TOKEN_VERSIONS = {"", "-1", "unknown", "none"}
+
+
+def _profile_add(profile: dict[str, Any], key: str, seconds: float) -> None:
+    if profiling_enabled():
+        profile[key] = float(profile.get(key, 0.0)) + float(seconds)
+
+
+def _profile_set(profile: dict[str, Any], key: str, value: Any) -> None:
+    if profiling_enabled():
+        profile[key] = value
+
+
+def _profile_public(profile: dict[str, Any]) -> dict[str, float]:
+    return {
+        str(key): float(value)
+        for key, value in profile.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
 
 
 def _canonical_json(value: Any) -> str:
@@ -922,10 +941,18 @@ def create_app(
         prompt_tokens: int,
         completion_tokens: int,
         response_id: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         message = _assistant_message(
             content, tool_calls, reasoning_content=reasoning_content
         )
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        if profile:
+            usage["profile"] = _profile_public(profile)
         return {
             "id": response_id or f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
@@ -934,11 +961,7 @@ def create_app(
             "choices": [
                 {"index": 0, "message": message, "finish_reason": finish_reason}
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": usage,
         }
 
     async def _pseudo_stream_chunks(
@@ -951,10 +974,15 @@ def create_app(
         prompt_tokens: int,
         completion_tokens: int,
         include_usage: bool,
+        profile: dict[str, Any] | None = None,
     ):
         created = int(time.time())
+        stream_started = time.perf_counter() if profiling_enabled() else 0.0
+        chunk_count = 0
 
         def _chunk(delta: dict[str, Any], reason: str | None = None) -> str:
+            nonlocal chunk_count
+            chunk_count += 1
             data = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -967,6 +995,9 @@ def create_app(
             return f"data: {json.dumps(data)}\n\n"
 
         def _usage_chunk() -> str:
+            if profile is not None and profiling_enabled():
+                profile["chat.stream_emit_s"] = time.perf_counter() - stream_started
+                profile["chat.stream_chunk_count"] = float(chunk_count)
             data = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -979,6 +1010,8 @@ def create_app(
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
             }
+            if profile:
+                data["usage"]["profile"] = _profile_public(profile)
             return f"data: {json.dumps(data)}\n\n"
 
         yield _chunk({"role": "assistant"})
@@ -1032,6 +1065,8 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        chat_profile: dict[str, Any] = {}
+        chat_started = time.perf_counter() if profiling_enabled() else 0.0
         _check_auth(request)
         body = await request.json()
         messages: list[dict] = body.get("messages", [])
@@ -1054,7 +1089,13 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         session_id = session.session_id
+        lock_wait_started = time.perf_counter() if profiling_enabled() else 0.0
         async with session.request_lock:
+            _profile_add(
+                chat_profile,
+                "chat.session_lock_wait_s",
+                time.perf_counter() - lock_wait_started,
+            )
             try:
                 session_manager.ensure_session_active(session_id, session)
             except SessionFinalizedError as exc:
@@ -1182,6 +1223,7 @@ def create_app(
                 partial_rollout=partial_rollout,
             )
             try:
+                generation_started = time.perf_counter() if profiling_enabled() else 0.0
                 router_response = await generation_controller.generate_preemptible(
                     input_ids=input_ids,
                     sampling_params=sampling_params,
@@ -1197,6 +1239,11 @@ def create_app(
                     ),
                     logprob_start_len=request_logprob_start_len,
                     context_window=context_window,
+                )
+                _profile_add(
+                    chat_profile,
+                    "chat.generation_s",
+                    time.perf_counter() - generation_started,
                 )
             except GenerationStaleEpoch as exc:
                 logger.warning(
@@ -1290,15 +1337,27 @@ def create_app(
                 tool_calls = None
                 reasoning_content = None
             else:
+                reasoning_started = time.perf_counter() if profiling_enabled() else 0.0
                 reasoning_result = await proxy_reasoning_parser.parse(
                     raw_text,
                     routing_key=session_id,
                 )
+                _profile_add(
+                    chat_profile,
+                    "chat.reasoning_parse_s",
+                    time.perf_counter() - reasoning_started,
+                )
                 reasoning_content = reasoning_result.reasoning_content
+                tool_started = time.perf_counter() if profiling_enabled() else 0.0
                 content, tool_calls = await proxy_tool_call_parser.parse(
                     reasoning_result.text,
                     tools,
                     routing_key=session_id,
+                )
+                _profile_add(
+                    chat_profile,
+                    "chat.tool_parse_s",
+                    time.perf_counter() - tool_started,
                 )
                 content = _strip_public_stop_markers(content)
                 if tool_calls:
@@ -1354,6 +1413,13 @@ def create_app(
                     add_generation_prompt=False,
                 )
 
+            generation_profile = router_response.meta_info.get("dressage_profile")
+            if isinstance(generation_profile, dict) and profiling_enabled():
+                for key, value in generation_profile.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        chat_profile[str(key)] = float(value)
+
+            record_started = time.perf_counter() if profiling_enabled() else 0.0
             session_manager.record_step(
                 session_id=session_id,
                 turn_id=effective_turn_id,
@@ -1388,6 +1454,11 @@ def create_app(
                 request_version=str(request_version),
                 response_version=str(response_version),
             )
+            _profile_add(
+                chat_profile,
+                "chat.record_step_s",
+                time.perf_counter() - record_started,
+            )
 
             if output_overflow:
                 details = dict(context_overflow)
@@ -1414,6 +1485,10 @@ def create_app(
                 )
 
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        _profile_set(chat_profile, "chat.prompt_tokens", float(prompt_tokens))
+        _profile_set(chat_profile, "chat.completion_tokens", float(public_completion_tokens))
+        _profile_set(chat_profile, "chat.tool_call_count", float(len(tool_calls or [])))
+        _profile_add(chat_profile, "chat.total_s", time.perf_counter() - chat_started)
         if stream:
             return StreamingResponse(
                 _pseudo_stream_chunks(
@@ -1426,6 +1501,7 @@ def create_app(
                     prompt_tokens,
                     public_completion_tokens,
                     include_usage,
+                    chat_profile,
                 ),
                 media_type="text/event-stream",
             )
@@ -1440,6 +1516,7 @@ def create_app(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=public_completion_tokens,
                 response_id=response_id,
+                profile=chat_profile,
             )
         )
 

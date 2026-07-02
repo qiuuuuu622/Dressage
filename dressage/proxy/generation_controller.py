@@ -230,6 +230,7 @@ class GenerationController:
                     routing_key=routing_key,
                     request_id=active.request_id,
                     logprob_start_len=chunk_logprob_start_len,
+                    profile=profile,
                 )
                 forced_preempted = active.abort_succeeded
             except Exception as exc:
@@ -618,6 +619,7 @@ class GenerationController:
         routing_key: str | None,
         request_id: str,
         logprob_start_len: int,
+        profile: dict[str, Any] | None = None,
     ) -> SGLangResponse:
         generate = self._sglang_client.generate
         try:
@@ -635,6 +637,8 @@ class GenerationController:
             kwargs["request_id"] = request_id
         if accepts_kwargs or "logprob_start_len" in parameters:
             kwargs["logprob_start_len"] = logprob_start_len
+        if profile is not None and (accepts_kwargs or "profile" in parameters):
+            kwargs["profile"] = profile
         return await generate(input_ids, sampling_params, **kwargs)
 
     async def _abort_active_with_timeout(
