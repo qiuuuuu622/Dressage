@@ -103,6 +103,11 @@ class FakeAdapter(BackendAdapter):
         self.shutdown_called = True
 
 
+class ActiveRequestProbeErrorAdapter(FakeAdapter):
+    async def has_active_request(self, session_context: SessionContext) -> bool:
+        raise RuntimeError(f"active request probe failed for {session_context.session_id}")
+
+
 class ContextOverflowAdapter(FakeAdapter):
     async def send_message(
         self,
@@ -499,6 +504,19 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         assert abort_data["mode"] == "fast_finalize"
         assert adapter.abort_calls == 0
 
+        second_register = client.post(
+            "/v1/rollout/register",
+            json={
+                **register_payload(
+                    prompt_file,
+                    bound_session_id="sess-002",
+                    bound_instance_id="inst-002",
+                ),
+                "router": "127.0.0.1:30001",
+            },
+        )
+        assert second_register.status_code == 200
+
 
 def test_abort_active_adapter_request_uses_real_abort(
     tmp_path: Path,
@@ -513,6 +531,27 @@ def test_abort_active_adapter_request_uses_real_abort(
         assert register_response.status_code == 200
 
         adapter.active_request_sessions.add("sess-001")
+        abort_response = client.post("/v1/sessions/sess-001/abort")
+
+    assert abort_response.status_code == 200
+    abort_data = abort_response.json()
+    assert abort_data["state"] == "aborted"
+    assert abort_data["mode"] == "best_effort"
+    assert adapter.abort_calls == 1
+
+
+def test_abort_active_request_probe_error_uses_real_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    adapter = ActiveRequestProbeErrorAdapter()
+    client = make_client(tmp_path, monkeypatch, adapter)
+
+    with client:
+        register_response = client.post("/v1/rollout/register", json=register_payload(prompt_file))
+        assert register_response.status_code == 200
+
         abort_response = client.post("/v1/sessions/sess-001/abort")
 
     assert abort_response.status_code == 200
