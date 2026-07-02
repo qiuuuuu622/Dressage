@@ -726,8 +726,33 @@ class BlackboxServer:
             )
         session_lock = await self._session_store.get_lock(session_id)
         assert session_lock is not None
-        await self._terminate_active_cmd(session_id)
 
+        if session_lock.locked():
+            return await self._abort_session_wait_locked(session_id, session, session_lock)
+
+        try:
+            await asyncio.wait_for(session_lock.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            return await self._abort_session_wait_locked(session_id, session, session_lock)
+
+        try:
+            if session.state == SessionState.ABORTED:
+                return self._abort_response(session_id, session, mode="noop")
+
+            if await self._session_requires_real_abort(session_id, session):
+                return await self._abort_session_locked(session_id, session)
+
+            self._mark_session_aborted(session)
+            return self._abort_response(session_id, session, mode="fast_finalize")
+        finally:
+            session_lock.release()
+
+    async def _abort_session_wait_locked(
+        self,
+        session_id: str,
+        session: SessionContext,
+        session_lock: asyncio.Lock,
+    ) -> AbortResponse:
         acquired = False
         try:
             try:
@@ -739,39 +764,72 @@ class BlackboxServer:
                     session_id,
                 )
 
-            if session.state == SessionState.ABORTED:
-                return AbortResponse(
-                    request_id="",
-                    session_id=session_id,
-                    instance_id=self._response_instance_id(),
-                    state=session.state,
-                    mode="noop",
-                )
+            if acquired and session.state == SessionState.ABORTED:
+                return self._abort_response(session_id, session, mode="noop")
 
-            if self._adapter is not None:
-                with contextlib.suppress(Exception):
-                    await self._adapter.abort_session(session)
-
-            session.state = SessionState.ABORTED
-            session.updated_at = utcnow()
-
-            now = utcnow()
-            for turn_record in session.turn_ledger.values():
-                if turn_record.status == TurnStatus.INFLIGHT:
-                    turn_record.status = TurnStatus.UNKNOWN
-                    turn_record.error = {"error": "aborted", "message": "Session was aborted while turn was in flight."}
-                    turn_record.updated_at = now
-
-            return AbortResponse(
-                request_id="",
-                session_id=session_id,
-                instance_id=self._response_instance_id(),
-                state=session.state,
-                mode="best_effort",
-            )
+            return await self._abort_session_locked(session_id, session)
         finally:
             if acquired:
                 session_lock.release()
+
+    async def _session_requires_real_abort(
+        self,
+        session_id: str,
+        session: SessionContext,
+    ) -> bool:
+        if session.state == SessionState.DESYNCED:
+            return True
+        if any(turn.status == TurnStatus.INFLIGHT for turn in session.turn_ledger.values()):
+            return True
+        if self._active_cmd_processes.get(session_id) is not None:
+            return True
+        if self._adapter is None:
+            return False
+        try:
+            return bool(await self._adapter.has_active_request(session))
+        except Exception:
+            return True
+
+    async def _abort_session_locked(
+        self,
+        session_id: str,
+        session: SessionContext,
+    ) -> AbortResponse:
+        await self._terminate_active_cmd(session_id)
+        if self._adapter is not None:
+            with contextlib.suppress(Exception):
+                await self._adapter.abort_session(session)
+        self._mark_session_aborted(session)
+        return self._abort_response(session_id, session, mode="best_effort")
+
+    def _mark_session_aborted(self, session: SessionContext) -> None:
+        session.state = SessionState.ABORTED
+        session.updated_at = utcnow()
+
+        now = utcnow()
+        for turn_record in session.turn_ledger.values():
+            if turn_record.status == TurnStatus.INFLIGHT:
+                turn_record.status = TurnStatus.UNKNOWN
+                turn_record.error = {
+                    "error": "aborted",
+                    "message": "Session was aborted while turn was in flight.",
+                }
+                turn_record.updated_at = now
+
+    def _abort_response(
+        self,
+        session_id: str,
+        session: SessionContext,
+        *,
+        mode: str,
+    ) -> AbortResponse:
+        return AbortResponse(
+            request_id="",
+            session_id=session_id,
+            instance_id=self._response_instance_id(),
+            state=session.state,
+            mode=mode,
+        )
 
     async def status(self) -> StatusResponse:
         counts = await self._session_store.counts()

@@ -42,6 +42,8 @@ class FakeAdapter(BackendAdapter):
     def __init__(self) -> None:
         self.initialized = False
         self.shutdown_called = False
+        self.abort_calls = 0
+        self.active_request_sessions: set[str] = set()
 
     async def initialize(self, binding_context) -> None:
         self.initialized = True
@@ -78,7 +80,11 @@ class FakeAdapter(BackendAdapter):
         )
 
     async def abort_session(self, session_context: SessionContext) -> bool:
+        self.abort_calls += 1
         return True
+
+    async def has_active_request(self, session_context: SessionContext) -> bool:
+        return session_context.session_id in self.active_request_sessions
 
     async def health(self) -> bool:
         return True
@@ -426,7 +432,8 @@ def test_register_rejects_invalid_openclaw_backend_options_as_request_error(
 
 
 def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt_file: Path):
-    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+    adapter = FakeAdapter()
+    client = make_client(tmp_path, monkeypatch, adapter)
     with client:
         register_response = client.post("/v1/rollout/register", json=register_payload(prompt_file))
         assert register_response.status_code == 200
@@ -489,6 +496,30 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         abort_data = abort_response.json()
         assert abort_data["state"] == "aborted"
         assert abort_data["instance_id"] == "inst-001"
+        assert abort_data["mode"] == "fast_finalize"
+        assert adapter.abort_calls == 0
+
+
+def test_abort_active_adapter_request_uses_real_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    adapter = FakeAdapter()
+    client = make_client(tmp_path, monkeypatch, adapter)
+
+    with client:
+        register_response = client.post("/v1/rollout/register", json=register_payload(prompt_file))
+        assert register_response.status_code == 200
+
+        adapter.active_request_sessions.add("sess-001")
+        abort_response = client.post("/v1/sessions/sess-001/abort")
+
+    assert abort_response.status_code == 200
+    abort_data = abort_response.json()
+    assert abort_data["state"] == "aborted"
+    assert abort_data["mode"] == "best_effort"
+    assert adapter.abort_calls == 1
 
 
 def test_abort_missing_session_is_idempotent(
@@ -835,7 +866,8 @@ def test_execute_cmd_enforces_bound_session(
 
 
 def test_timeout_marks_session_desynced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt_file: Path):
-    client = make_client(tmp_path, monkeypatch, SlowAdapter())
+    adapter = SlowAdapter()
+    client = make_client(tmp_path, monkeypatch, adapter)
     with client:
         register_response = client.post(
             "/v1/rollout/register",
@@ -872,6 +904,14 @@ def test_timeout_marks_session_desynced(tmp_path: Path, monkeypatch: pytest.Monk
             },
         )
         assert conflict_response.status_code == 409
+
+        abort_calls_before_abort_endpoint = adapter.abort_calls
+        abort_response = client.post("/v1/sessions/sess-001/abort")
+        assert abort_response.status_code == 200
+        abort_data = abort_response.json()
+        assert abort_data["state"] == "aborted"
+        assert abort_data["mode"] == "best_effort"
+        assert adapter.abort_calls == abort_calls_before_abort_endpoint + 1
 
 
 def test_message_fingerprint_includes_reasoning_content(

@@ -279,7 +279,7 @@ class AbortResponse(BaseModel):
     instance_id: str | None = None
     action: Literal["abort"] = "abort"
     state: SessionState
-    mode: Literal["best_effort", "noop", "missing"]
+    mode: Literal["best_effort", "noop", "missing", "fast_finalize"]
 
 
 class SessionStats(BaseModel):
