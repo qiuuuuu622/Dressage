@@ -183,6 +183,10 @@ class BackendAdapter(ABC):
     async def abort_session(self, session_context: SessionContext) -> bool:
         raise NotImplementedError
 
+    async def has_active_request(self, session_context: SessionContext) -> bool:
+        del session_context
+        return False
+
     @abstractmethod
     async def health(self) -> bool:
         raise NotImplementedError

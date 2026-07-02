@@ -39,6 +39,7 @@ from blackbox_server.core.models import (
     TurnUsage,
     utcnow,
 )
+from blackbox_server.core.profiling import ProfileRecorder
 from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
 
 _OC_MSG_COUNT_KEY = "__bbs_opencode_msg_count"
@@ -194,23 +195,33 @@ class OpencodeAdapter(BackendAdapter):
         turn_context: TurnContext,
         new_messages: list[Message],
     ) -> AdapterResponse:
+        profile = ProfileRecorder()
+        profile.set("opencode.input_messages", float(len(new_messages)))
         deadline = asyncio.get_running_loop().time() + turn_context.deadline_seconds
-        if not await self.health():
-            raise BackendProcessError("opencode backend is not healthy.")
+        async with profile.measure_async("opencode.health_s"):
+            if not await self.health():
+                raise BackendProcessError("opencode backend is not healthy.")
         if self._proxy is not None:
-            await self._proxy.open_turn(turn_context.turn_id, backend_session_id=session_context.backend_session_id)
+            async with profile.measure_async("opencode.proxy_open_turn_s"):
+                await self._proxy.open_turn(
+                    turn_context.turn_id,
+                    backend_session_id=session_context.backend_session_id,
+                )
 
         success = False
         try:
-            backend_session_id = await self._ensure_backend_session(
-                session_context,
-                self._remaining_timeout(deadline, operation="ensure opencode session"),
-            )
+            async with profile.measure_async("opencode.ensure_session_s"):
+                backend_session_id = await self._ensure_backend_session(
+                    session_context,
+                    self._remaining_timeout(deadline, operation="ensure opencode session"),
+                )
             if self._proxy is not None:
-                await self._proxy.update_turn_backend_session(backend_session_id)
+                async with profile.measure_async("opencode.proxy_update_turn_s"):
+                    await self._proxy.update_turn_backend_session(backend_session_id)
 
             message = new_messages[0]
             prev_msg_count = int(session_context.metadata.get(_OC_MSG_COUNT_KEY, 0) or 0)
+            profile.set("opencode.prev_msg_count", float(prev_msg_count))
             payload = {
                 "parts": [{"type": "text", "text": message.content}],
                 "agent": "build",
@@ -221,28 +232,35 @@ class OpencodeAdapter(BackendAdapter):
                     json_body=payload,
                     deadline=deadline,
                     operation="send opencode message",
+                    )
+            )
+            async with profile.measure_async("opencode.post_message_s"):
+                post_result = await self._await_backend_task_or_proxy_max_steps(
+                    post_task,
+                    session_context=session_context,
+                    proxy=self._proxy,
                 )
-            )
-            post_result = await self._await_backend_task_or_proxy_max_steps(
-                post_task,
-                session_context=session_context,
-                proxy=self._proxy,
-            )
             _raise_if_opencode_structured_error(post_result, self._options)
             # Wait until the proxied upstream turn has fully drained so we do not
             # snapshot opencode history before the final assistant/tool messages land.
             if self._proxy is not None:
-                await self._proxy.drain_turn(
-                    timeout=self._remaining_timeout(deadline, operation="wait for rollout proxy drain")
+                async with profile.measure_async("opencode.proxy_drain_s"):
+                    await self._proxy.drain_turn(
+                        timeout=self._remaining_timeout(deadline, operation="wait for rollout proxy drain")
+                    )
+                async with profile.measure_async("opencode.proxy_error_check_s"):
+                    await self._raise_if_proxy_context_overflow()
+                    await self._raise_if_proxy_rollout_invalidated()
+                for key, value in (await self._proxy.turn_profile()).items():
+                    profile.set(key, value)
+            async with profile.measure_async("opencode.history_fetch_s"):
+                all_messages, outputs, trace_events, usage = await self._request_get_with_retry(
+                    f"/session/{backend_session_id}/message",
+                    deadline=deadline,
+                    turn_id=turn_context.turn_id,
+                    prev_msg_count=prev_msg_count,
                 )
-                await self._raise_if_proxy_context_overflow()
-                await self._raise_if_proxy_rollout_invalidated()
-            all_messages, outputs, trace_events, usage = await self._request_get_with_retry(
-                f"/session/{backend_session_id}/message",
-                deadline=deadline,
-                turn_id=turn_context.turn_id,
-                prev_msg_count=prev_msg_count,
-            )
+            profile.set("opencode.new_msg_count", float(len(all_messages) - prev_msg_count))
             session_context.metadata[_OC_MSG_COUNT_KEY] = len(all_messages)
             success = True
             return AdapterResponse(
@@ -250,16 +268,19 @@ class OpencodeAdapter(BackendAdapter):
                 trace_events=trace_events,
                 usage=usage,
                 backend_session_id=backend_session_id,
+                profile=profile.snapshot(),
             )
         finally:
             if self._proxy is not None:
                 drain_timeout = None if success else 2.0
                 try:
-                    await self._proxy.drain_turn(timeout=drain_timeout)
+                    async with profile.measure_async("opencode.final_proxy_drain_s"):
+                        await self._proxy.drain_turn(timeout=drain_timeout)
                 except asyncio.TimeoutError:
                     LOGGER.warning("Timed out draining rollout proxy requests for turn %s", turn_context.turn_id)
                 finally:
-                    await self._proxy.clear_turn()
+                    async with profile.measure_async("opencode.proxy_clear_turn_s"):
+                        await self._proxy.clear_turn()
 
     async def abort_session(self, session_context: SessionContext) -> bool:
         if self._client is None or session_context.backend_session_id is None:
@@ -351,22 +372,25 @@ class OpencodeAdapter(BackendAdapter):
 
         if self._process is not None:
             if self._process.returncode is None:
-                # Try to terminate the entire process group first
+                # Graceful: SIGTERM the whole process group, give it 3s.
                 if self._process_group_id is not None:
-                    try:
+                    with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
                         os.killpg(self._process_group_id, signal.SIGTERM)
                         await asyncio.wait_for(self._process.wait(), timeout=3.0)
-                    except (ProcessLookupError, asyncio.TimeoutError):
-                        pass
-                
-                # Fallback to individual process termination
+                # Force-kill the leader if still alive.
                 if self._process.returncode is None:
-                    self._process.terminate()
-                    try:
-                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
                         self._process.kill()
-                        await self._process.wait()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._process.wait(), timeout=5.0)
+            # Always SIGKILL the whole process group, even if the leader already exited:
+            # opencode (node, started with start_new_session=True) forks children that
+            # otherwise survive, reparent to init (ppid=1), and — because soft reset (unlike
+            # hard) does NOT tear down the bwrap sandbox — accumulate across slot reuse until
+            # they starve new opencode startups and initialize() fails with 502.
+            if self._process_group_id is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self._process_group_id, signal.SIGKILL)
             self._process = None
             self._process_group_id = None
 

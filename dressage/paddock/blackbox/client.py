@@ -25,8 +25,16 @@ class BlackboxServerClient:
 
     def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
         self._owns_client = client is None
+        limits = httpx.Limits(
+            max_connections=_env_int(
+                "DRESSAGE_BLACKBOX_HTTP_MAX_CONNECTIONS", 1024, min_value=1
+            ),
+            max_keepalive_connections=_env_int(
+                "DRESSAGE_BLACKBOX_HTTP_MAX_KEEPALIVE_CONNECTIONS", 256, min_value=0
+            ),
+        )
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(None), trust_env=False
+            timeout=httpx.Timeout(None), trust_env=False, limits=limits
         )
 
     async def health(self, endpoint: SandboxEndpoint) -> dict[str, Any]:
@@ -104,6 +112,40 @@ class BlackboxServerClient:
             headers=endpoint.headers,
         )
         response.raise_for_status()
+        return response.json()
+
+    async def abort_session(
+        self,
+        endpoint: SandboxEndpoint,
+        *,
+        session_id: str,
+        timeout: float | None = 10.0,
+    ) -> dict[str, Any]:
+        """Abort an in-flight blackbox session so it reaches the ABORTED terminal state.
+
+        Needed when a rollout drops/cancels a trajectory mid-turn: the engine-side
+        ``abort_all`` only stops the LLM, leaving the *stateful* env session ACTIVE.
+        ``has_open_sessions()`` counts ACTIVE as occupied, so the next rollout step's
+        rebind is rejected with 409 ("Cannot rebind while active or desynced sessions
+        still exist"). The server forces the session to ABORTED within a bounded time.
+        """
+        response = await self._client.post(
+            f"{endpoint.url.rstrip('/')}/v1/sessions/{session_id}/abort",
+            headers=endpoint.headers,
+            timeout=timeout,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return {
+                    "request_id": "",
+                    "session_id": session_id,
+                    "action": "abort",
+                    "state": "aborted",
+                    "mode": "missing",
+                }
+            raise
         return response.json()
 
     async def pause(

@@ -3840,6 +3840,43 @@ def test_finalize_concat_mode_does_not_tokenize_messages():
     assert_concat_mask_for_outputs(item, ["hello", "follow"])
 
 
+def test_finalize_session_is_idempotent_after_successful_finalize():
+    client, _, _, _ = make_client(make_response("hello"))
+
+    completion = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-idempotent", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert completion.status_code == 200
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-idempotent", "instance_id": "inst"},
+    )
+    assert finalized.status_code == 200
+    assert finalized.json()["mode"] == "finalized"
+
+    drained = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-idempotent", "instance_id": "inst", "drain": True},
+    )
+    assert drained.status_code == 200
+    assert len(drained.json()["data"]) == 1
+
+    repeated = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-idempotent", "instance_id": "inst"},
+    )
+    assert repeated.status_code == 200
+    repeated_payload = repeated.json()
+    assert repeated_payload["success"] is True
+    assert repeated_payload["mode"] == "already_finalized"
+    assert repeated_payload["session_id"] == "sess-idempotent"
+    assert repeated_payload["trajectory_id"] == "sess-idempotent"
+    assert repeated_payload["num_segments"] == 1
+
+
 def test_finalize_concat_mode_keeps_tool_call_output_and_masks_tool_response_context():
     raw_tool = '<tool_call>{"name": "search", "arguments": {"q": "x"}}</tool_call>'
     client, session_manager, _, _ = make_client(

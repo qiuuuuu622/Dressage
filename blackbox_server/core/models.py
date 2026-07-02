@@ -81,6 +81,7 @@ class AdapterResponse(BaseModel):
     trace_events: list[TraceEvent] = Field(default_factory=list)
     usage: TurnUsage = Field(default_factory=TurnUsage)
     backend_session_id: str
+    profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class BackendCapabilities(BaseModel):
@@ -231,6 +232,7 @@ class MessageResponse(BaseModel):
     outputs: list[Message]
     backend: BackendRef
     usage: TurnUsage
+    profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExecuteCmdRequest(BaseModel):
@@ -277,7 +279,7 @@ class AbortResponse(BaseModel):
     instance_id: str | None = None
     action: Literal["abort"] = "abort"
     state: SessionState
-    mode: Literal["best_effort", "noop"]
+    mode: Literal["best_effort", "noop", "missing"]
 
 
 class SessionStats(BaseModel):

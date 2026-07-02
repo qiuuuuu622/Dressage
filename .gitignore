@@ -41,3 +41,16 @@ dressage-blackbox-runtime/
 CLAUDE.md
 AGENTS.md
 .claude
+
+# H200 runtime logs / run markers
+*.log
+*.pid
+.last_*
+profiles/
+reports/
+slime/wandb/
+monitor_sglang_avg.out
+
+# Core dumps
+core.*
+slime/core.*

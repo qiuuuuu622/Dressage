@@ -232,6 +232,12 @@ class FakeProxy:
     async def consume_context_overflow_error(self) -> dict[str, Any] | None:
         return None
 
+    async def consume_rollout_invalidated_error(self) -> dict[str, Any] | None:
+        return None
+
+    async def turn_profile(self) -> dict[str, float]:
+        return {}
+
     async def wait_for_max_steps_error(self, timeout: float | None = None) -> dict[str, Any] | None:
         if self.max_steps_payload is not None:
             return dict(self.max_steps_payload)

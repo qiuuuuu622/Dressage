@@ -12,9 +12,12 @@ contributing N times more weight than single-segment ones.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from dressage.training.log_helpers import compute_trajectory_mean_raw_reward
+
+logger = logging.getLogger(__name__)
 
 
 def _sample_has_trainable_loss(sample: Any) -> bool:

@@ -65,6 +65,7 @@ from blackbox_server.core.models import (
     utcnow,
 )
 from blackbox_server.core.monitoring import BackendMonitor
+from blackbox_server.core.profiling import ProfileRecorder, profile_response
 from blackbox_server.runtime.paths import ensure_runtime_dir, make_runtime_id, remove_runtime_dir
 from blackbox_server.store.session_store import SessionStore
 
@@ -383,26 +384,44 @@ class BlackboxServer:
         }
 
     async def send_message(self, session_id: str, request: MessageRequest) -> MessageResponse:
-        self._ensure_state_ready_for_messages()
-        await self._wait_if_paused()
-        self._validate_identifier("session_id", session_id)
-        if request.turn_id is not None:
-            self._validate_identifier("turn_id", request.turn_id)
-        capabilities = self._require_capabilities()
-        self._validate_message_request(request.messages, capabilities)
+        return await self._send_message_profiled(session_id, request)
+
+    @profile_response("server.message_total_s")
+    async def _send_message_profiled(
+        self,
+        session_id: str,
+        request: MessageRequest,
+        *,
+        profile: ProfileRecorder,
+    ) -> MessageResponse:
+        profile.set("server.request_messages", float(len(request.messages)))
+
+        with profile.measure("server.preflight_s"):
+            self._ensure_state_ready_for_messages()
+            self._validate_identifier("session_id", session_id)
+            if request.turn_id is not None:
+                self._validate_identifier("turn_id", request.turn_id)
+            capabilities = self._require_capabilities()
+            self._validate_message_request(request.messages, capabilities)
+
+        async with profile.measure_async("server.pause_wait_s"):
+            await self._wait_if_paused()
 
         assert self._binding_context is not None
         assert self._adapter is not None
 
-        bound_session_id = self._require_bound_session_match(session_id)
-        if bound_session_id is None:
-            raise ApiError(
-                500,
-                "internal_error",
-                "Rollout binding is missing bound_session_id.",
-            )
-        session = await self._session_store.get(bound_session_id)
-        session_lock = await self._session_store.get_lock(bound_session_id)
+        with profile.measure("server.binding_match_s"):
+            bound_session_id = self._require_bound_session_match(session_id)
+            if bound_session_id is None:
+                raise ApiError(
+                    500,
+                    "internal_error",
+                    "Rollout binding is missing bound_session_id.",
+                )
+
+        async with profile.measure_async("server.session_lookup_s"):
+            session = await self._session_store.get(bound_session_id)
+            session_lock = await self._session_store.get_lock(bound_session_id)
         if session is None or session_lock is None:
             raise ApiError(
                 500,
@@ -411,7 +430,9 @@ class BlackboxServer:
                 details={"session_id": bound_session_id},
             )
 
-        async with session_lock:
+        with profile.measure("server.session_lock_wait_s"):
+            await session_lock.acquire()
+        try:
             if session.state == SessionState.ABORTED:
                 raise ApiError(
                     409,
@@ -446,6 +467,7 @@ class BlackboxServer:
                         details={"session_id": session_id, "turn_id": effective_turn_id},
                     )
                 if existing.status == TurnStatus.COMMITTED and existing.response is not None:
+                    profile.set("server.idempotent_replay", 1.0)
                     return MessageResponse(
                         request_id="",
                         session_id=session_id,
@@ -474,19 +496,21 @@ class BlackboxServer:
                     details={"session_id": session_id, "turn_id": effective_turn_id},
                 )
 
-            if not await self._adapter_health_with_retry("before_send_message"):
-                await self._mark_backend_error("adapter_healthcheck_failed")
-                raise ApiError(503, "service_unavailable", "Backend is unavailable.")
+            async with profile.measure_async("server.adapter_health_s"):
+                if not await self._adapter_health_with_retry("before_send_message"):
+                    await self._mark_backend_error("adapter_healthcheck_failed")
+                    raise ApiError(503, "service_unavailable", "Backend is unavailable.")
 
-            now = utcnow()
-            session.turn_ledger[effective_turn_id] = TurnRecord(
-                turn_id=effective_turn_id,
-                request_fingerprint=request_fingerprint,
-                status=TurnStatus.INFLIGHT,
-                request_messages=request.messages,
-                created_at=now,
-                updated_at=now,
-            )
+            with profile.measure("server.turn_ledger_s"):
+                now = utcnow()
+                session.turn_ledger[effective_turn_id] = TurnRecord(
+                    turn_id=effective_turn_id,
+                    request_fingerprint=request_fingerprint,
+                    status=TurnStatus.INFLIGHT,
+                    request_messages=request.messages,
+                    created_at=now,
+                    updated_at=now,
+                )
 
             turn_context = TurnContext(
                 turn_id=effective_turn_id,
@@ -495,20 +519,25 @@ class BlackboxServer:
                 deadline_seconds=self._effective_config.backend_timeout,
             )
             try:
-                adapter_response = await self._wait_for_backend_call_excluding_pause(
-                    self._adapter.send_message(session, turn_context, request.messages),
-                    timeout=self._effective_config.backend_timeout,
-                )
-                session.backend_session_id = adapter_response.backend_session_id
-                session.conversation_history.extend(request.messages)
-                session.conversation_history.extend(adapter_response.outputs)
-                session.trace_events.extend(adapter_response.trace_events)
-                session.turn_count += 1
-                session.updated_at = utcnow()
-                turn_record = session.turn_ledger[effective_turn_id]
-                turn_record.status = TurnStatus.COMMITTED
-                turn_record.response = adapter_response
-                turn_record.updated_at = utcnow()
+                async with profile.measure_async("server.adapter_send_s"):
+                    adapter_response = await self._wait_for_backend_call_excluding_pause(
+                        self._adapter.send_message(session, turn_context, request.messages),
+                        timeout=self._effective_config.backend_timeout,
+                    )
+                for key, value in adapter_response.profile.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        profile.set(f"adapter.{key}", float(value))
+                with profile.measure("server.commit_s"):
+                    session.backend_session_id = adapter_response.backend_session_id
+                    session.conversation_history.extend(request.messages)
+                    session.conversation_history.extend(adapter_response.outputs)
+                    session.trace_events.extend(adapter_response.trace_events)
+                    session.turn_count += 1
+                    session.updated_at = utcnow()
+                    turn_record = session.turn_ledger[effective_turn_id]
+                    turn_record.status = TurnStatus.COMMITTED
+                    turn_record.response = adapter_response
+                    turn_record.updated_at = utcnow()
                 return MessageResponse(
                     request_id="",
                     session_id=session_id,
@@ -585,6 +614,8 @@ class BlackboxServer:
                     f"Backend request failed: {exc}",
                     details={"session_id": session_id, "turn_id": effective_turn_id},
                 ) from exc
+        finally:
+            session_lock.release()
 
     async def execute_cmd(self, session_id: str, request: ExecuteCmdRequest) -> ExecuteCmdResponse:
         self._ensure_state_ready_for_messages()
@@ -686,7 +717,13 @@ class BlackboxServer:
         self._require_bound_session_match(session_id)
         session = await self._session_store.get(session_id)
         if session is None:
-            raise ApiError(404, "not_found", "Session does not exist.", details={"session_id": session_id})
+            return AbortResponse(
+                request_id="",
+                session_id=session_id,
+                instance_id=self._response_instance_id(),
+                state=SessionState.ABORTED,
+                mode="missing",
+            )
         session_lock = await self._session_store.get_lock(session_id)
         assert session_lock is not None
         await self._terminate_active_cmd(session_id)
@@ -755,6 +792,17 @@ class BlackboxServer:
         LOGGER.error("marking backend error: %s", reason)
         self._state = ServerState.ERROR
         await self._session_store.mark_all_non_aborted_desynced()
+
+    async def _runtime_monitor_check(self) -> bool:
+        if await self._adapter_health_with_retry("runtime_monitor"):
+            return True
+        if await self._session_store.has_inflight_turns():
+            LOGGER.warning(
+                "backend health check failed during runtime_monitor while turns are in flight; "
+                "deferring backend error"
+            )
+            return True
+        return False
 
     async def _handle_unknown_turn(
         self,
@@ -877,7 +925,7 @@ class BlackboxServer:
             return
         self._monitor = BackendMonitor(
             interval_seconds=self._effective_config.runtime_health_check_interval,
-            check=lambda: self._adapter_health_with_retry("runtime_monitor"),
+            check=self._runtime_monitor_check,
             on_failure=lambda: self._mark_backend_error("runtime_monitor_failed"),
         )
         self._monitor.start()

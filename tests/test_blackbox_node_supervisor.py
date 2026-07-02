@@ -112,6 +112,10 @@ async def _run_node_supervisor_starts_leases_and_releases_slots(tmp_path):
         reset_strategy="soft",
         start_health_loop=False,
     )
+    async def abort_noop(*args, **kwargs):
+        del args, kwargs
+
+    supervisor._abort_blackbox_session = abort_noop
 
     ready = await supervisor.start_pool()
     first = await supervisor.acquire("traj-1")
@@ -121,7 +125,11 @@ async def _run_node_supervisor_starts_leases_and_releases_slots(tmp_path):
         trajectory_id="traj-1",
         reason="test",
     )
-    await asyncio.sleep(0)
+    for _ in range(20):
+        status = await supervisor.health()
+        if status["ready"] == 2 and status["leased"] == 0:
+            break
+        await asyncio.sleep(0.01)
     status = await supervisor.health()
     await supervisor.shutdown()
 

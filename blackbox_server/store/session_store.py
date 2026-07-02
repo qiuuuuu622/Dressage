@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 from blackbox_server.core.errors import SessionCapacityError
-from blackbox_server.core.models import SessionContext, SessionState, utcnow
+from blackbox_server.core.models import SessionContext, SessionState, TurnStatus, utcnow
 
 
 class SessionStore:
@@ -64,6 +64,12 @@ class SessionStore:
     async def has_open_sessions(self) -> bool:
         return any(
             session.state in {SessionState.ACTIVE, SessionState.DESYNCED}
+            for session in self._sessions.values()
+        )
+
+    async def has_inflight_turns(self) -> bool:
+        return any(
+            any(turn.status == TurnStatus.INFLIGHT for turn in session.turn_ledger.values())
             for session in self._sessions.values()
         )
 

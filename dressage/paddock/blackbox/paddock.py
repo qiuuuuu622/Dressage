@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+import logging
 import os
+import time
 from typing import Any
+
+import httpx
 
 from dressage.paddock.blackbox.client import BlackboxServerClient
 from dressage.paddock.blackbox.common.defaults import (
@@ -16,11 +22,23 @@ from dressage.paddock.blackbox.common.state import SandboxState
 from dressage.paddock.blackbox.common.utils import (
     _require_public_proxy_url,
     _validate_public_proxy_url,
+    _env_int,
 )
 from dressage.paddock.interface import BlackboxPaddock
 from dressage.sandbox import SandboxEndpoint, SandboxLease, SandboxServiceSpec, SandboxSpec
 from dressage.sandbox.factory import create_sandbox_provider_from_env
 from dressage.sandbox.provider import SandboxProvider
+
+logger = logging.getLogger(__name__)
+_REGISTER_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_REGISTER_RECYCLE_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+)
 
 
 class BlackboxAgentPaddock(BlackboxPaddock):
@@ -53,7 +71,9 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             }
         self._wait_health = wait_health
         self._leases: dict[str, SandboxLease] = {}
+        self._specs: dict[str, SandboxSpec] = {}
         self._states: dict[str, SandboxState] = {}
+        self._cleanup_tasks: set[asyncio.Task[dict[str, Any]]] = set()
 
     async def init(
         self,
@@ -77,6 +97,9 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             timeout_sec=env_args.get("sandbox_timeout_sec"),
             metadata={"paddock_mode": "blackbox"},
         )
+        return await self._create_state_from_spec(spec)
+
+    async def _create_state_from_spec(self, spec: SandboxSpec) -> SandboxState:
         lease = await self._provider.create(spec)
         endpoint = lease.endpoints.get("blackbox")
         if endpoint is None:
@@ -89,9 +112,10 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         endpoint = endpoint.normalized()
         if self._wait_health:
             await self._client.health(endpoint)
-        self._leases[traj_id] = lease
+        self._leases[spec.trajectory_id] = lease
+        self._specs[spec.trajectory_id] = spec
         state = SandboxState(
-            trajectory_id=traj_id,
+            trajectory_id=spec.trajectory_id,
             sandbox_url=endpoint.url,
             sandbox_id=lease.sandbox_id,
             raw_register_response={
@@ -103,7 +127,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
                 },
             },
         )
-        self._states[traj_id] = state
+        self._states[spec.trajectory_id] = state
         return state
 
     async def register_agent(
@@ -118,21 +142,106 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         router_api_path: str = "/v1",
     ) -> dict[str, Any]:
         state = self._resolve_state(state)
-        lease = self._leases.get(state.trajectory_id)
-        endpoint = self._endpoint_for_state(state, lease)
         router = _validate_public_proxy_url(router_url or self._proxy_public_url)
         blackbox_type = normalize_blackbox_type(blackbox_type)
+        merged_backend_options = merge_backend_options(blackbox_type, backend_options)
+        server_config = _server_config_for_provider(self._provider.name, blackbox_type)
+        recycle_attempts = _env_int(
+            "DRESSAGE_BLACKBOX_REGISTER_RECYCLE_ATTEMPTS",
+            1,
+            min_value=0,
+        )
+        async with _register_limit():
+            for attempt in range(recycle_attempts + 1):
+                try:
+                    result = await self._register_agent_once(
+                        state,
+                        instance_id=instance_id,
+                        session_id=session_id,
+                        router_url=router,
+                        blackbox_type=blackbox_type,
+                        backend_options=merged_backend_options,
+                        server_config=server_config,
+                        router_api_path=router_api_path,
+                    )
+                    _set_lease_profile_value(
+                        state,
+                        "profile.register.recycle_attempts",
+                        float(attempt),
+                    )
+                    return result
+                except httpx.HTTPStatusError as exc:
+                    if not _should_recycle_register_error(exc) or attempt >= recycle_attempts:
+                        raise
+                    logger.warning(
+                        "register_agent failed with retryable status=%s for trajectory_id=%s; "
+                        "recycling sandbox slot (%d/%d)",
+                        exc.response.status_code,
+                        state.trajectory_id,
+                        attempt + 1,
+                        recycle_attempts,
+                    )
+                    state = await self._recycle_state_for_register(state)
+                except _REGISTER_RECYCLE_ERRORS as exc:
+                    if attempt >= recycle_attempts:
+                        raise
+                    logger.warning(
+                        "register_agent transport failure for trajectory_id=%s; "
+                        "recycling sandbox slot (%d/%d): %s",
+                        state.trajectory_id,
+                        attempt + 1,
+                        recycle_attempts,
+                        exc,
+                    )
+                    state = await self._recycle_state_for_register(state)
+
+        raise RuntimeError("unreachable register_agent recycle loop exit")
+
+    async def _register_agent_once(
+        self,
+        state: SandboxState,
+        *,
+        instance_id: str,
+        session_id: str,
+        router_url: str,
+        blackbox_type: str,
+        backend_options: Any,
+        server_config: dict[str, Any],
+        router_api_path: str,
+    ) -> dict[str, Any]:
+        lease = self._leases.get(state.trajectory_id)
+        endpoint = self._endpoint_for_state(state, lease)
         return await self._client.register_agent(
             endpoint,
             trajectory_id=state.trajectory_id,
             instance_id=instance_id,
             session_id=session_id,
-            router_url=router,
+            router_url=router_url,
             blackbox_type=blackbox_type,
-            backend_options=merge_backend_options(blackbox_type, backend_options),
-            server_config=_server_config_for_provider(self._provider.name, blackbox_type),
+            backend_options=backend_options,
+            server_config=server_config,
             router_api_path=router_api_path,
         )
+
+    async def _recycle_state_for_register(self, state: SandboxState) -> SandboxState:
+        spec = self._specs.get(state.trajectory_id)
+        if spec is None:
+            raise KeyError(
+                f"sandbox spec not found for trajectory_id={state.trajectory_id}"
+            )
+        lease = self._leases.get(state.trajectory_id)
+        if lease is None:
+            await self._provider.terminate(state.trajectory_id)
+        else:
+            await self._provider.terminate(lease)
+        self._leases.pop(state.trajectory_id, None)
+        self._states.pop(state.trajectory_id, None)
+        new_state = await self._create_state_from_spec(spec)
+        state.sandbox_url = new_state.sandbox_url
+        state.sandbox_id = new_state.sandbox_id
+        state.raw_register_response = new_state.raw_register_response
+        self._states[state.trajectory_id] = state
+        return state
 
     async def call_agent(
         self,
@@ -214,16 +323,130 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         env_args: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        del env_args, kwargs
+        terminate_env_args = {**(env_args or {}), **kwargs}
+        skip_abort = _skip_abort_on_terminate(terminate_env_args)
+        terminate_start = time.perf_counter()
         state = self._states.pop(traj_id, None)
         lease = self._leases.pop(traj_id, None)
-        if lease is None:
-            if state is None:
-                return {"terminated": False, "trajectory_id": traj_id, "missing": True}
-            return await self._provider.terminate(state.trajectory_id)
-        return await self._provider.terminate(lease)
+        self._specs.pop(traj_id, None)
+        if lease is None and state is None:
+            return {"terminated": False, "trajectory_id": traj_id, "missing": True}
+
+        if not _background_terminate_enabled():
+            return await self._terminate_cleanup(
+                traj_id,
+                state=state,
+                lease=lease,
+                terminate_start=terminate_start,
+                skip_abort=skip_abort,
+            )
+
+        task = asyncio.create_task(
+            self._terminate_cleanup(
+                traj_id,
+                state=state,
+                lease=lease,
+                terminate_start=terminate_start,
+                skip_abort=skip_abort,
+            )
+        )
+        self._track_cleanup_task(task)
+        lease_id = None if lease is None else lease.sandbox_id
+        return {
+            "terminated": True,
+            "trajectory_id": traj_id,
+            "lease_id": lease_id,
+            "release_queued": True,
+            "cleanup_background": True,
+        }
+
+    async def _terminate_cleanup(
+        self,
+        traj_id: str,
+        *,
+        state: SandboxState | None,
+        lease: SandboxLease | None,
+        terminate_start: float,
+        skip_abort: bool = False,
+    ) -> dict[str, Any]:
+        warn_after = _terminate_warn_sec()
+        # Abort the env session before the provider can mark the slot reusable. A
+        # trajectory dropped mid-turn (drop-tail / engine abort_all kills its LLM
+        # request) otherwise lingers as ACTIVE and can make the next rebind fail with
+        # 409. This cleanup may run in the background; provider release/reset still
+        # controls when the slot becomes ready again.
+        if state is not None and not skip_abort:
+            abort_start = time.perf_counter()
+            try:
+                endpoint = self._endpoint_for_state(state, lease)
+                abort_response = await self._client.abort_session(
+                    endpoint,
+                    session_id=traj_id,
+                    timeout=_terminate_abort_timeout_sec(),
+                )
+                logger.debug(
+                    "blackbox abort_session completed session_id=%s mode=%s state=%s",
+                    traj_id,
+                    abort_response.get("mode"),
+                    abort_response.get("state"),
+                )
+            except Exception as exc:  # noqa: BLE001 - never block release on abort failure
+                logger.info(
+                    "abort_session best-effort failed for session_id=%s exc_type=%s: %s",
+                    traj_id,
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                abort_seconds = time.perf_counter() - abort_start
+                if abort_seconds >= warn_after:
+                    logger.warning(
+                        "slow blackbox abort_session session_id=%s took %.3fs",
+                        traj_id,
+                        abort_seconds,
+                    )
+        elif state is not None:
+            logger.debug(
+                "skip blackbox abort_session for cleanly finalized session_id=%s",
+                traj_id,
+            )
+        provider_start = time.perf_counter()
+        try:
+            if lease is None:
+                assert state is not None
+                return await self._provider.terminate(state.trajectory_id)
+            return await self._provider.terminate(lease)
+        finally:
+            provider_seconds = time.perf_counter() - provider_start
+            total_seconds = time.perf_counter() - terminate_start
+            if provider_seconds >= warn_after or total_seconds >= warn_after:
+                logger.warning(
+                    "slow blackbox terminate session_id=%s provider=%.3fs total=%.3fs",
+                    traj_id,
+                    provider_seconds,
+                    total_seconds,
+                )
+
+    def _track_cleanup_task(self, task: asyncio.Task[dict[str, Any]]) -> None:
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._discard_cleanup_task)
+
+    def _discard_cleanup_task(self, task: asyncio.Task[dict[str, Any]]) -> None:
+        self._cleanup_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - background cleanup must be observable
+            logger.warning("blackbox background terminate cleanup failed: %s", exc)
+
+    async def drain_cleanup_tasks(self) -> None:
+        while self._cleanup_tasks:
+            tasks = tuple(self._cleanup_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self) -> None:
+        await self.drain_cleanup_tasks()
         close = getattr(self._client, "close", None)
         if close is not None:
             await close()
@@ -258,6 +481,49 @@ def _provider_blackbox_port_env(provider_name: str) -> str | None:
     return None
 
 
+def _should_recycle_register_error(exc: httpx.HTTPStatusError) -> bool:
+    return exc.response.status_code in {502, 503, 504}
+
+
+def _background_terminate_enabled() -> bool:
+    return os.environ.get("DRESSAGE_BLACKBOX_BACKGROUND_TERMINATE", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _skip_abort_on_terminate(env_args: dict[str, Any]) -> bool:
+    value = env_args.get("blackbox_skip_abort")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+@asynccontextmanager
+async def _register_limit():
+    concurrency = _env_int("DRESSAGE_BLACKBOX_REGISTER_CONCURRENCY", 0, min_value=0)
+    if concurrency <= 0:
+        yield
+        return
+    semaphore = _REGISTER_SEMAPHORES.get(concurrency)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(concurrency)
+        _REGISTER_SEMAPHORES[concurrency] = semaphore
+    async with semaphore:
+        yield
+
+
+def _set_lease_profile_value(state: SandboxState, key: str, value: float) -> None:
+    raw = state.raw_register_response
+    metadata = raw.get("metadata") if isinstance(raw, dict) else None
+    if isinstance(metadata, dict):
+        metadata[key] = value
+
+
 def _server_config_for_provider(provider_name: str, blackbox_type: str) -> dict[str, Any]:
     config = server_config_for(blackbox_type)
     if provider_name == "local_bwrap":
@@ -265,3 +531,21 @@ def _server_config_for_provider(provider_name: str, blackbox_type: str) -> dict[
         # root comes from BBS_RUNTIME_ROOT in the server process environment.
         config.pop("runtime_root", None)
     return config
+
+
+def _terminate_warn_sec() -> float:
+    raw = os.environ.get("DRESSAGE_BLACKBOX_TERMINATE_WARN_SEC", "1")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.0
+    return max(0.0, value)
+
+
+def _terminate_abort_timeout_sec() -> float:
+    raw = os.environ.get("DRESSAGE_BLACKBOX_TERMINATE_ABORT_TIMEOUT_SEC", "6")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 6.0
+    return max(0.1, value)

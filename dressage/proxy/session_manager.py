@@ -52,6 +52,7 @@ class StepRecord:
     concat_incremental_tokenization_failed: bool = False
     response_routed_experts: str | None = None
     response_routed_experts_chunks: list[dict[str, Any]] = field(default_factory=list)
+    profile: dict[str, Any] = field(default_factory=dict)
     tools: list[dict[str, Any]] | None = None
     segment_boundary_before: bool = False
     rewrite_reason: str | None = None
@@ -121,6 +122,7 @@ class SessionManager:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
         self._finalized_session_ids: dict[str, float] = {}
+        self._finalized_session_metadata: dict[str, dict[str, Any]] = {}
         self._session_timeout = session_timeout
 
     @staticmethod
@@ -336,6 +338,7 @@ class SessionManager:
         concat_incremental_tokenization_failed: bool = False,
         response_routed_experts: str | None = None,
         response_routed_experts_chunks: list[dict[str, Any]] | None = None,
+        profile: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         segment_boundary_before: bool = False,
         rewrite_reason: str | None = None,
@@ -383,6 +386,7 @@ class SessionManager:
                     response_routed_experts_chunks=[
                         dict(item) for item in (response_routed_experts_chunks or [])
                     ],
+                    profile=dict(profile or {}),
                     tools=tools,
                     segment_boundary_before=segment_boundary_before,
                     rewrite_reason=rewrite_reason,
@@ -418,6 +422,19 @@ class SessionManager:
                 self._finalized_session_ids[session_id] = time.time()
             return session
 
+    def get_finalized_session_metadata(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._cleanup_expired_locked()
+            payload = self._finalized_session_metadata.get(session_id)
+            return dict(payload) if payload is not None else None
+
+    def set_finalized_session_metadata(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> None:
+        with self._lock:
+            self._finalized_session_ids[session_id] = time.time()
+            self._finalized_session_metadata[session_id] = dict(payload)
+
     def active_count(self) -> int:
         with self._lock:
             self._cleanup_expired_locked()
@@ -439,3 +456,4 @@ class SessionManager:
         ]
         for session_id in expired_finalized:
             del self._finalized_session_ids[session_id]
+            self._finalized_session_metadata.pop(session_id, None)

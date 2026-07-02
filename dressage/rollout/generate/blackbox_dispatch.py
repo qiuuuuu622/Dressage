@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -30,6 +31,7 @@ from dressage.paddock.lifecycle import (
     exception_summary as _exception_summary,
     schedule_terminate_paddock,
 )
+from dressage.profiling import add_duration, async_time_block, enabled as profiling_enabled
 from dressage.rollout import multi_segment
 from dressage.rollout.artifacts.samples import (
     instance_id as _instance_id,
@@ -75,6 +77,54 @@ def _backend_options_for_register(
     return merge_backend_options(blackbox_type, backend_options, args=args)
 
 
+def _copy_lease_profile(metadata: dict[str, Any], state: Any) -> None:
+    if not profiling_enabled():
+        return
+    raw_register = getattr(state, "raw_register_response", None)
+    lease_metadata = (
+        raw_register.get("metadata")
+        if isinstance(raw_register, dict)
+        else None
+    )
+    if not isinstance(lease_metadata, dict):
+        return
+    profile = metadata.setdefault("dressage_profile", {})
+    for key, value in lease_metadata.items():
+        if not key.startswith("profile."):
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            profile[f"sandbox.{key.removeprefix('profile.')}"] = float(value)
+
+
+def _copy_call_agent_profile(metadata: dict[str, Any], payload: Any) -> None:
+    if not profiling_enabled() or not isinstance(payload, dict):
+        return
+    profile = metadata.setdefault("dressage_profile", {})
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        for source_key, target_key in (
+            ("steps", "blackbox.agent_steps"),
+            ("tool_calls", "blackbox.tool_calls"),
+            ("input_tokens", "blackbox.input_tokens"),
+            ("output_tokens", "blackbox.output_tokens"),
+            ("total_tokens", "blackbox.total_tokens"),
+            ("reasoning_tokens", "blackbox.reasoning_tokens"),
+        ):
+            value = usage.get(source_key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                profile[target_key] = float(value)
+    call_profile = payload.get("profile")
+    if isinstance(call_profile, dict):
+        details = metadata.setdefault("dressage_profile_details", {})
+        for key, value in call_profile.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                profile[f"blackbox.{key}"] = float(value)
+            elif isinstance(value, str) and (
+                key.endswith("_json") or "timeline" in key
+            ):
+                details[f"blackbox.{key}"] = value
+
+
 async def generate(
     args: Any,
     sample: Any,
@@ -115,6 +165,8 @@ async def generate(
     state = None
     initialized = False
     agent_response = ""
+    clean_session_complete = False
+    total_start = time.perf_counter() if profiling_enabled() else 0.0
     try:
         execute_cmd_schedule = parse_blackbox_execute_cmds(
             metadata.get("blackbox_execute_cmds")
@@ -126,46 +178,53 @@ async def generate(
         )
         paddock = get_paddock_from_env(allow_whitebox_mode=False)
         proxy_client = get_proxy_client()
-        state = await maybe_await(
-            paddock.init(
-                session_id,
-                metadata.get("env_type"),
-                env_args,
+        async with async_time_block(metadata, "blackbox.paddock_init"):
+            state = await maybe_await(
+                paddock.init(
+                    session_id,
+                    metadata.get("env_type"),
+                    env_args,
+                )
             )
-        )
         initialized = True
+        _copy_lease_profile(metadata, state)
         if not hasattr(paddock, "register_agent"):
             raise TypeError(f"{type(paddock).__name__} does not implement register_agent")
-        await maybe_await(
-            paddock.register_agent(
-                state,
-                instance_id=instance_id,
-                session_id=session_id,
-                router_url=proxy_url(),
-                blackbox_type=blackbox_type,
-                backend_options=backend_options,
+        async with async_time_block(metadata, "blackbox.register_agent"):
+            await maybe_await(
+                paddock.register_agent(
+                    state,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    router_url=proxy_url(),
+                    blackbox_type=blackbox_type,
+                    backend_options=backend_options,
+                )
             )
-        )
-        await execute_blackbox_cmds_for_stage(
-            paddock,
-            state,
-            metadata,
-            schedule=execute_cmd_schedule,
-            session_id=session_id,
-            stage="before_agent",
-        )
+        _copy_lease_profile(metadata, state)
+        async with async_time_block(metadata, "blackbox.before_agent_cmds"):
+            await execute_blackbox_cmds_for_stage(
+                paddock,
+                state,
+                metadata,
+                schedule=execute_cmd_schedule,
+                session_id=session_id,
+                stage="before_agent",
+            )
         call_payload: Any = None
         call_succeeded = False
         try:
-            call_payload = await maybe_await(
-                paddock.call_agent(
-                    state,
-                    session_id=session_id,
-                    messages=_chat_messages_from_prompt(sample.prompt),
-                    metadata={"source": "dressage", **metadata},
+            async with async_time_block(metadata, "blackbox.call_agent"):
+                call_payload = await maybe_await(
+                    paddock.call_agent(
+                        state,
+                        session_id=session_id,
+                        messages=_chat_messages_from_prompt(sample.prompt),
+                        metadata={"source": "dressage", **metadata},
+                    )
                 )
-            )
             call_succeeded = True
+            _copy_call_agent_profile(metadata, call_payload)
         except Exception as exc:
             if agent_failure := failure_from_call_agent_exception(exc):
                 record_agent_failure_metadata(metadata, agent_failure)
@@ -191,28 +250,33 @@ async def generate(
                 record_agent_failure_metadata(metadata, agent_failure)
                 raise agent_failure
 
-        await execute_blackbox_cmds_for_stage(
-            paddock,
-            state,
-            metadata,
-            schedule=execute_cmd_schedule,
-            session_id=session_id,
-            stage="after_agent",
-        )
-        await proxy_client.finalize_session(
-            session_id, instance_id=instance_id, label=getattr(sample, "label", None)
-        )
-        trajectory_payload = await proxy_client.read_trajectory(
-            trajectory_id=session_id,
-            instance_id=instance_id,
-            drain=True,
-        )
-        try:
-            await _ARTIFACT_WRITER.write_session_payload(
-                trajectory_payload,
+        async with async_time_block(metadata, "blackbox.after_agent_cmds"):
+            await execute_blackbox_cmds_for_stage(
+                paddock,
+                state,
+                metadata,
+                schedule=execute_cmd_schedule,
                 session_id=session_id,
-                instance_id=instance_id,
+                stage="after_agent",
             )
+        async with async_time_block(metadata, "proxy.finalize_session"):
+            await proxy_client.finalize_session(
+                session_id, instance_id=instance_id, label=getattr(sample, "label", None)
+            )
+        async with async_time_block(metadata, "proxy.read_trajectory"):
+            trajectory_payload = await proxy_client.read_trajectory(
+                trajectory_id=session_id,
+                instance_id=instance_id,
+                drain=True,
+            )
+        clean_session_complete = True
+        try:
+            async with async_time_block(metadata, "artifact.write_session_payload"):
+                await _ARTIFACT_WRITER.write_session_payload(
+                    trajectory_payload,
+                    session_id=session_id,
+                    instance_id=instance_id,
+                )
         except Exception:
             logger.warning(
                 "failed to write trajectory payload log for session_id=%s",
@@ -221,25 +285,27 @@ async def generate(
             )
         segments = trajectory_payload.get("data") or []
         base_metadata_for_logs = dict(metadata)
-        result = multi_segment.expand_segments_to_samples(
-            sample,
-            segments,
-            args=args,
-            agent_response=agent_response,
-            session_id=session_id,
-            instance_id=instance_id,
-        )
-        log_template = sample
-        try:
-            await _ARTIFACT_WRITER.write_segment_samples(
-                log_template,
+        async with async_time_block(metadata, "rollout.expand_segments"):
+            result = multi_segment.expand_segments_to_samples(
+                sample,
+                segments,
                 args=args,
-                segments=segments,
-                base_metadata=base_metadata_for_logs,
+                agent_response=agent_response,
                 session_id=session_id,
                 instance_id=instance_id,
-                agent_response=agent_response,
             )
+        log_template = sample
+        try:
+            async with async_time_block(metadata, "artifact.write_segment_samples"):
+                await _ARTIFACT_WRITER.write_segment_samples(
+                    log_template,
+                    args=args,
+                    segments=segments,
+                    base_metadata=base_metadata_for_logs,
+                    session_id=session_id,
+                    instance_id=instance_id,
+                    agent_response=agent_response,
+                )
         except Exception:
             logger.warning(
                 "failed to write sample logs for session_id=%s",
@@ -284,9 +350,14 @@ async def generate(
         _set_status(sample, "ABORTED")
         return sample
     finally:
+        if profiling_enabled():
+            add_duration(metadata, "blackbox.generate_total", time.perf_counter() - total_start)
         if initialized and paddock is not None:
+            terminate_env_args = dict(env_args)
+            if clean_session_complete:
+                terminate_env_args["blackbox_skip_abort"] = True
             schedule_terminate_paddock(
                 paddock,
                 session_id=session_id,
-                env_args=env_args,
+                env_args=terminate_env_args,
             )

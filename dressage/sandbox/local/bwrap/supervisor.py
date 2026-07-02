@@ -696,6 +696,14 @@ class LocalBwrapNodeSupervisorCore:
                 slot.status = SLOT_EMPTY if self._closed else SLOT_READY
                 return
             if self.reset_strategy == "soft":
+                # Soft reset reuses the running blackbox server process, so its in-memory
+                # session store survives. Abort the just-released session server-side
+                # BEFORE marking the slot READY, otherwise the next trajectory's register
+                # hits the lingering ACTIVE session and the rebind is rejected with 409
+                # "Cannot rebind while active or desynced sessions still exist". The slot
+                # stays SLOT_RELEASING (not is_available) until this awaits out, so no
+                # reuse can race it.
+                await self._abort_blackbox_session(slot, session_id)
                 slot.config.clear_runtime_dirs()
                 slot.status = SLOT_EMPTY if self._closed else SLOT_READY
                 slot.last_error = None
@@ -744,6 +752,35 @@ class LocalBwrapNodeSupervisorCore:
                 slot.status = SLOT_EMPTY
                 return
             await self._start_slot(slot)
+
+    async def _abort_blackbox_session(self, slot: SlotRuntime, session_id: str | None) -> None:
+        """Force the slot's blackbox server to abort ``session_id`` so a soft reset leaves
+        a clean session store (see the soft branch in ``_reset_slot``). Without this the
+        reused slot's server keeps the prior ACTIVE session and the next register 409s.
+
+        Best-effort and bounded: a 404 means the session is already gone; any error must
+        never block the slot from returning to the pool. Uses a timeout >= the server-side
+        forced-abort budget (5s lock) so the POST does not return before the abort lands.
+        """
+        if session_id is None or self.pool_mode == POOL_COMMAND_ONLY:
+            return
+        try:
+            response = await self._client.post(
+                f"{slot.sandbox_url}/v1/sessions/{session_id}/abort",
+                timeout=httpx.Timeout(8.0),
+            )
+            if response.status_code >= 500:
+                logger.debug(
+                    "soft-reset abort_session non-2xx node_id=%s slot_id=%s "
+                    "session_id=%s status=%s",
+                    self.node_id, slot.config.slot_id, session_id, response.status_code,
+                )
+        except httpx.HTTPError as exc:
+            logger.debug(
+                "soft-reset abort_session best-effort failed node_id=%s slot_id=%s "
+                "session_id=%s: %s",
+                self.node_id, slot.config.slot_id, session_id, exc,
+            )
 
     async def _wait_until_healthy(self, slot: SlotRuntime) -> None:
         if _env_bool("DRESSAGE_BLACKBOX_SKIP_HEALTHCHECK", False):

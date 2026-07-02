@@ -6,6 +6,31 @@ bwrap 沙箱 agentic rollout)的踩坑、修复与推理调优结论。
 
 ---
 
+## 0. 前置依赖与运行模式
+
+**必装:**
+
+| 依赖 | 用途 | 安装 |
+|---|---|---|
+| `bwrap`(bubblewrap) | agentic rollout 的本地黑盒沙箱(`local_bwrap`)隔离进程 | `apt-get install -y bubblewrap`(或对应发行版包管理器) |
+| `opencode` | rollout 的 agent CLI(trajectory 里的 system prompt 即 opencode),负责多轮工具调用 | 按 opencode 官方方式安装,确保在 PATH 中 |
+
+**运行模式:跑脚本时用 hard 重置模式**
+
+启动时设 `DRESSAGE_BLACKBOX_RESET_STRATEGY=hard`(沙箱每次 rollout 做 hard reset,重启进程做干净隔离):
+
+```bash
+cd /root/Dressage
+DRESSAGE_BLACKBOX_RESET_STRATEGY=hard \
+BASE_FOLDER=/root/model_dist nohup bash examples/scripts/run_blackbox_qwen3.5_35b_a3b_sync_local.sh \
+  > /root/Dressage/log/run_main.log 2>&1 &
+```
+
+> 注:hard 比 soft 慢(hard 会无并发限制地重启沙箱进程,第二次 rollout 可能变慢);
+> 这里按要求用 hard(更彻底的隔离/干净状态)。若只追吞吐可换 `soft`。
+
+---
+
 ## 1. 快速启动
 
 模型权重需放在 `BASE_FOLDER` 下(默认 `/root/model_dist`),包含三份:

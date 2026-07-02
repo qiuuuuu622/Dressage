@@ -333,15 +333,40 @@ def test_blackbox_failures_parse_expected_generation_preempted_abort():
     assert expected_abort_from_call_agent_exception(exc) == "generation_preempted"
 
 
+def test_blackbox_failures_parse_backend_error_abort_for_messages():
+    exc = _http_status_error(
+        502,
+        {
+            "error": "backend_error",
+            "message": "Backend request failed: Server disconnected without sending a response.",
+        },
+    )
+
+    assert expected_abort_from_call_agent_exception(exc) == "backend_error"
+
+
 def test_blackbox_failures_ignore_non_expected_abort_http_errors():
     assert (
         expected_abort_from_call_agent_exception(
             _http_status_error(
                 502,
                 {
-                    "error": "backend_error",
+                    "error": "bad_gateway",
                     "message": "Backend request failed: ordinary backend failure",
                 },
+            )
+        )
+        is None
+    )
+    assert (
+        expected_abort_from_call_agent_exception(
+            _http_status_error(
+                502,
+                {
+                    "error": "backend_error",
+                    "message": "Failed to initialize backend",
+                },
+                url="http://sandbox.test/v1/rollout/register",
             )
         )
         is None
@@ -382,8 +407,10 @@ def test_blackbox_failures_record_abort_for_retry_metadata():
 def _http_status_error(
     status_code: int,
     json_body: dict | None = None,
+    *,
+    url: str = "http://sandbox.test/v1/sessions/bbs-sess/messages",
 ) -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", "http://sandbox/messages")
+    request = httpx.Request("POST", url)
     if json_body is None:
         response = httpx.Response(status_code, content=b"not-json", request=request)
     else:

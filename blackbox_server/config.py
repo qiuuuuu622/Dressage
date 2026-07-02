@@ -36,8 +36,8 @@ class BlackboxServerConfig(BaseModel):
     health_check_interval: float = 2.0
     health_check_timeout: float = 60.0
     runtime_health_check_interval: float = 10.0
-    runtime_health_check_retries: int = Field(default=5, ge=1)
-    runtime_health_check_retry_delay: float = Field(default=1, ge=0.0)
+    runtime_health_check_retries: int = Field(default=10, ge=1)
+    runtime_health_check_retry_delay: float = Field(default=2.0, ge=0.0)
 
     @classmethod
     def from_env(cls) -> "BlackboxServerConfig":
@@ -55,10 +55,10 @@ class BlackboxServerConfig(BaseModel):
                 "BBS_RUNTIME_HEALTH_CHECK_INTERVAL", 10.0
             ),
             runtime_health_check_retries=_get_env_int(
-                "BBS_RUNTIME_HEALTH_CHECK_RETRIES", 3
+                "BBS_RUNTIME_HEALTH_CHECK_RETRIES", 10
             ),
             runtime_health_check_retry_delay=_get_env_float(
-                "BBS_RUNTIME_HEALTH_CHECK_RETRY_DELAY", 0.5
+                "BBS_RUNTIME_HEALTH_CHECK_RETRY_DELAY", 2.0
             ),
         )
 

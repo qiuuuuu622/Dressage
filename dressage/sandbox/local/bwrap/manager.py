@@ -769,7 +769,13 @@ class LocalBwrapClusterManagerCore:
                 )
                 return
 
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(
+                _env_float(
+                    "DRESSAGE_BLACKBOX_BACKGROUND_RELEASE_POLL_SEC",
+                    1.0,
+                    min_value=0.05,
+                )
+            )
 
     async def _refresh_nodes_if_needed_locked(self, *, force: bool) -> None:
         if self._closed:

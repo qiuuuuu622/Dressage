@@ -147,6 +147,63 @@ Full batch ─── all samples complete ───▶ Train step
 - Training GPU is idle during the entire rollout phase
 - **Best for**: development, debugging, small-scale experiments
 
+#### Tail Batching (RollPacker)
+
+Sync mode includes an optional **tail batching** strategy (inspired by [RollPacker](https://arxiv.org/abs/2509.21009)) that mitigates the long-tail problem — where a batch's completion time is dominated by the slowest trajectory, causing GPU idle.
+
+```text
+Short round:  submit 1.25×P₀  ──race──▶  collect P₀ fastest  ──▶  abort tail
+                                                                   │
+                                              tail groups cleaned + queued
+                                                                   │
+Long round:   queue ≥ P₀  ─────────────────▶  process all P₀  ──▶  no abort
+```
+
+**How it works:**
+
+1. **Short round** (default): Oversample η=1.25×, collect the first P₀ groups that complete, abort the rest. Instead of discarding the aborted tail, clean the prompt groups (clear partial responses/session IDs) and push them to `_LONG_PROMPT_QUEUE`.
+2. **Long round** (triggered when queue ≥ P₀): Take P₀ groups from the queue, submit without oversampling, and wait for **all** to complete — no abort. Since all prompts in the queue are inherently "slow", speculative execution (oversampling) is disabled to avoid infinite queue growth.
+3. The cycle alternates: ~4 short rounds + 1 long round (adaptive based on actual abort rate).
+
+**On-policy guarantee:** Aborted prompt groups have no completed trajectories (response="" — partial data is cleaned). In the long round, trajectories are generated fresh under the current weight version. No cross-version data leakage.
+
+> [!NOTE]
+> GRPO groups are never split across rounds. A group (one prompt × `n_samples_per_prompt` clones) is the atomic unit of submission, abort, and re-queue. The entire group is either completed in the short round or re-generated from scratch in the long round.
+
+<details>
+<summary><b> Tail Batching Configuration</b></summary>
+<br>
+
+| Environment Variable | Default | Description |
+| :--- | :--- | :--- |
+| `DRESSAGE_TAIL_BATCHING` | `1` (enabled) | Set to `0` to disable tail batching and revert to the original discard-tail behavior |
+| `DRESSAGE_TAIL_BATCH_LONG_THRESHOLD` | `1.0` | Queue size threshold (as a fraction of `rollout_batch_size`) to trigger a long round. E.g., `1.0` means the queue must have at least `rollout_batch_size` groups |
+| `DRESSAGE_SYNC_OVERSAMPLE` | `1.25` | Oversample factor for short rounds (η). `1.0` disables oversampling |
+
+```bash
+# Enable tail batching (default)
+export DRESSAGE_TAIL_BATCHING=1
+
+# Adjust long round trigger threshold
+export DRESSAGE_TAIL_BATCH_LONG_THRESHOLD=1.0
+
+# Adjust oversample factor
+export DRESSAGE_SYNC_OVERSAMPLE=1.25
+
+# Disable tail batching (revert to discard-tail behavior)
+export DRESSAGE_TAIL_BATCHING=0
+```
+
+**Metrics:**
+
+| Metric | Description |
+| :--- | :--- |
+| `rollout/round_type` | 0 = short round, 1 = long round |
+| `rollout/long_prompt_queue_size` | Current size of the long-tail prompt queue |
+| `rollout/dropped_tail_groups` | Groups discarded (0 when tail batching is enabled) |
+
+</details>
+
 ### Fully Async Mode
 
 Background worker pipelines keep prompt groups in flight continuously. Completed groups are buffered and assembled into training batches when enough are ready.
@@ -203,6 +260,11 @@ DRESSAGE_PARTIAL_ROLLOUT_TARGET_GROUPS=<int>
 DRESSAGE_PARTIAL_ROLLOUT_TARGET_SAMPLES=<int>
 DRESSAGE_ROLLOUT_MAX_RETRIES=2
 DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH=0
+
+# Tail batching (RollPacker) for sync mode
+DRESSAGE_TAIL_BATCHING=1
+DRESSAGE_TAIL_BATCH_LONG_THRESHOLD=1.0
+DRESSAGE_SYNC_OVERSAMPLE=1.25
 ```
 
 > [!TIP]

@@ -74,6 +74,7 @@ class FakeAdapter(BackendAdapter):
             ],
             usage=TurnUsage(total_tokens=10, input_tokens=4, output_tokens=6, steps=1),
             backend_session_id=session_context.backend_session_id,
+            profile={"fake.send_message_s": 0.001},
         )
 
     async def abort_session(self, session_context: SessionContext) -> bool:
@@ -135,6 +136,32 @@ class SlowAdapter(FakeAdapter):
     ) -> AdapterResponse:
         await asyncio.sleep(0.2)
         return await super().send_message(session_context, turn_context, new_messages)
+
+
+class BusyUnhealthyAdapter(FakeAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inflight = False
+        self.inflight_health_failures = 0
+
+    async def send_message(
+        self,
+        session_context: SessionContext,
+        turn_context: TurnContext,
+        new_messages: list[Message],
+    ) -> AdapterResponse:
+        self.inflight = True
+        try:
+            await asyncio.sleep(0.15)
+            return await super().send_message(session_context, turn_context, new_messages)
+        finally:
+            self.inflight = False
+
+    async def health(self) -> bool:
+        if self.inflight:
+            self.inflight_health_failures += 1
+            return False
+        return True
 
 
 class FlakyHealthAdapter(FakeAdapter):
@@ -426,6 +453,10 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         assert message_data["outputs"][0]["content"] == "echo: hello"
         assert message_data["outputs"][0]["reasoning_content"] == "thought: hello"
         assert message_data["backend"]["backend_session_id"] == "oc-session-1"
+        assert message_data["profile"]["server.message_total_s"] >= 0
+        assert message_data["profile"]["server.adapter_send_s"] >= 0
+        assert message_data["profile"]["server.session_lock_wait_s"] >= 0
+        assert message_data["profile"]["adapter.fake.send_message_s"] == 0.001
 
         replay_response = client.post("/v1/sessions/sess-001/messages", json=message_payload)
         assert replay_response.status_code == 200
@@ -434,6 +465,8 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         assert replay_data["idempotent_replay"] is True
         assert replay_data["outputs"][0]["content"] == "echo: hello"
         assert replay_data["outputs"][0]["reasoning_content"] == "thought: hello"
+        assert replay_data["profile"]["server.message_total_s"] >= 0
+        assert replay_data["profile"]["server.idempotent_replay"] == 1.0
 
         session_response = client.get(
             "/v1/sessions/sess-001",
@@ -456,6 +489,22 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         abort_data = abort_response.json()
         assert abort_data["state"] == "aborted"
         assert abort_data["instance_id"] == "inst-001"
+
+
+def test_abort_missing_session_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+
+    with client:
+        abort_response = client.post("/v1/sessions/sess-missing/abort")
+
+    assert abort_response.status_code == 200
+    abort_data = abort_response.json()
+    assert abort_data["session_id"] == "sess-missing"
+    assert abort_data["state"] == "aborted"
+    assert abort_data["mode"] == "missing"
 
 
 
@@ -1161,3 +1210,44 @@ def test_transient_health_failure_is_retried_before_returning_503(
         assert message_response.status_code == 200
         assert message_response.json()["outputs"][0]["content"] == "echo: hello"
         assert adapter.health_calls == 3
+
+
+def test_runtime_monitor_defers_health_failure_while_turn_is_inflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    adapter = BusyUnhealthyAdapter()
+    client = make_client(tmp_path, monkeypatch, adapter)
+
+    with client:
+        register_response = client.post(
+            "/v1/rollout/register",
+            json={
+                **register_payload(prompt_file),
+                "server_config": {
+                    "backend_timeout": 1.0,
+                    "runtime_health_check_interval": 0.01,
+                    "runtime_health_check_retries": 1,
+                    "runtime_health_check_retry_delay": 0.0,
+                },
+            },
+        )
+        assert register_response.status_code == 200
+
+        message_response = client.post(
+            "/v1/sessions/sess-001/messages",
+            json={
+                "turn_id": "turn-runtime-monitor-busy",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert message_response.status_code == 200
+        message_data = message_response.json()
+        assert message_data["state"] == "active"
+        assert message_data["outputs"][0]["content"] == "echo: hello"
+        assert adapter.inflight_health_failures > 0
+
+        health_response = client.get("/health")
+        assert health_response.status_code == 200
+        assert health_response.json()["state"] == "ready"

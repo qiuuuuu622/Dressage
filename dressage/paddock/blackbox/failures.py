@@ -115,15 +115,19 @@ def expected_abort_from_call_agent_exception(exc: BaseException) -> str | None:
         return None
     if exc.response.status_code != 502:
         return None
+    if "/v1/sessions/" not in exc.request.url.path or not exc.request.url.path.endswith(
+        "/messages"
+    ):
+        return None
 
     payload = _http_error_json(exc)
     if payload.get("error") != "backend_error":
         return None
 
     message = payload.get("message")
-    if message is None or GENERATION_PREEMPTED_MARKER not in str(message):
-        return None
-    return "generation_preempted"
+    if message is not None and GENERATION_PREEMPTED_MARKER in str(message):
+        return "generation_preempted"
+    return "backend_error"
 
 
 def record_agent_failure_metadata(

@@ -189,7 +189,6 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         if self._samples is None:
             return buffer_samples + super().get_samples(num_samples)
 
-        n_per = getattr(self.args, "n_samples_per_prompt", 1)
         groups = []
 
         for _ in range(num_samples):
@@ -204,19 +203,26 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
 
             base_sample = self._samples[self.sample_offset]
             self.sample_offset += 1
-
-            group = []
-            for _ in range(n_per):
-                s = copy.deepcopy(base_sample)
-                s.group_index = self.sample_group_index
-                s.index = self.sample_index
-                self.sample_index += 1
-                group.append(s)
-
-            self.sample_group_index += 1
-            groups.append(group)
+            groups.append(self._clone_base(base_sample))
 
         return buffer_samples + groups
+
+    def _clone_base(self, base_sample: "Sample") -> list["Sample"]:
+        """Expand one base prompt into a GRPO group of n_samples_per_prompt clones.
+
+        Shared by the sequential and tail-batched paths so index/group_index
+        bookkeeping is identical.
+        """
+        n_per = getattr(self.args, "n_samples_per_prompt", 1)
+        group = []
+        for _ in range(n_per):
+            s = copy.deepcopy(base_sample)
+            s.group_index = self.sample_group_index
+            s.index = self.sample_index
+            self.sample_index += 1
+            group.append(s)
+        self.sample_group_index += 1
+        return group
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
         if not self.buffer or num_samples == 0:

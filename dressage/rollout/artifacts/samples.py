@@ -322,6 +322,18 @@ def write_sample_from_segment(
     sample.metadata["instance_id"] = instance_id
     sample.metadata["messages"] = messages
     sample.metadata["proxy_extra_info"] = segment.get("extra_info") or {}
+    proxy_profile = sample.metadata["proxy_extra_info"].get("dressage_profile")
+    if isinstance(proxy_profile, dict):
+        existing_profile = sample.metadata.get("dressage_profile")
+        merged_profile = (
+            dict(existing_profile) if isinstance(existing_profile, dict) else {}
+        )
+        for key, value in proxy_profile.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                merged_profile[key] = float(merged_profile.get(key, 0.0)) + float(value)
+            else:
+                merged_profile[key] = value
+        sample.metadata["dressage_profile"] = merged_profile
     sample.metadata.pop("dressage_partial_rollout", None)
     sample.metadata.pop("dressage_async_group_id", None)
     sample.metadata.pop("response_versions", None)

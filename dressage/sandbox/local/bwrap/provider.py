@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable
 import os
+import time
 from typing import Any
 
+import httpx
+
 from dressage.config import local_bwrap_manager_name, local_bwrap_namespace
+from dressage.profiling import enabled as profiling_enabled
 from dressage.sandbox.local.bwrap.supervisor import (
     POOL_BLACKBOX,
     POOL_COMMAND_ONLY,
@@ -15,6 +20,8 @@ from dressage.sandbox.local.bwrap.supervisor import (
     normalize_pool_mode,
 )
 from dressage.sandbox.types import CommandResult, SandboxEndpoint, SandboxLease, SandboxSpec
+
+_ACQUIRE_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
 
 class LocalBwrapSandboxProvider:
@@ -47,11 +54,17 @@ class LocalBwrapSandboxProvider:
         self._leases: dict[str, SandboxLease] = {}
 
     async def create(self, spec: SandboxSpec) -> SandboxLease:
+        total_start = time.perf_counter() if profiling_enabled() else 0.0
         paddock_mode = _paddock_mode_from_spec(spec)
         expected_pool_mode = (
             POOL_BLACKBOX if paddock_mode == "blackbox" else POOL_COMMAND_ONLY
         )
+        status_before = await _manager_status(self._manager) if profiling_enabled() else None
+        pool_mode_start = time.perf_counter() if profiling_enabled() else 0.0
         pool_mode = await _manager_pool_mode(self._manager)
+        pool_mode_seconds = (
+            time.perf_counter() - pool_mode_start if profiling_enabled() else None
+        )
         if pool_mode != expected_pool_mode:
             raise RuntimeError(
                 "local_bwrap pool mode does not match paddock mode: "
@@ -59,13 +72,62 @@ class LocalBwrapSandboxProvider:
                 f"connected pool_mode={pool_mode!r}; stop the current pool and start "
                 "the correct DRESSAGE_LOCAL_BWRAP_POOL_MODE"
             )
-        payload = await _remote_call(
-            self._manager,
-            "acquire",
-            trajectory_id=spec.trajectory_id,
-            env_type=spec.env_type,
-            env_args=spec.env_args,
+        acquire_start = time.perf_counter() if profiling_enabled() else 0.0
+        health_recycles = 0
+        recycle_attempts = (
+            _env_int("DRESSAGE_LOCAL_BWRAP_ACQUIRE_HEALTH_RECYCLE_ATTEMPTS", 1, min_value=0)
+            if paddock_mode == "blackbox"
+            else 0
         )
+        payload: dict[str, Any]
+        async with _acquire_limit():
+            for attempt in range(recycle_attempts + 1):
+                payload = await _remote_call(
+                    self._manager,
+                    "acquire",
+                    trajectory_id=spec.trajectory_id,
+                    env_type=spec.env_type,
+                    env_args=spec.env_args,
+                )
+                if (
+                    paddock_mode != "blackbox"
+                    or not _spec_requests_service(spec, "blackbox")
+                    or not _env_bool(
+                    "DRESSAGE_LOCAL_BWRAP_ACQUIRE_HEALTH_PRECHECK",
+                    True,
+                    )
+                ):
+                    break
+                sandbox_url = payload.get("sandbox_url")
+                if sandbox_url and await _blackbox_health_ok(str(sandbox_url).rstrip("/")):
+                    break
+                health_recycles += 1
+                await _remote_call(
+                    self._manager,
+                    "release",
+                    trajectory_id=spec.trajectory_id,
+                    lease_id=payload.get("lease_id"),
+                    reason="acquire_health_precheck_failed",
+                )
+                if attempt >= recycle_attempts:
+                    raise RuntimeError(
+                        "local_bwrap acquired blackbox slot failed health precheck "
+                        f"after {attempt + 1} attempt(s)"
+                    )
+        acquire_seconds = (
+            time.perf_counter() - acquire_start if profiling_enabled() else None
+        )
+        status_after = await _manager_status(self._manager) if profiling_enabled() else None
+        profile_metadata = {}
+        if profiling_enabled():
+            profile_metadata = {
+                "profile.provider.pool_mode": pool_mode_seconds,
+                "profile.provider.acquire": acquire_seconds,
+                "profile.provider.create": time.perf_counter() - total_start,
+                "profile.provider.acquire_health_recycles": float(health_recycles),
+                **_status_profile("provider.slot.before", status_before),
+                **_status_profile("provider.slot.after", status_after),
+            }
         lease = SandboxLease(
             trajectory_id=spec.trajectory_id,
             provider=self.name,
@@ -83,6 +145,7 @@ class LocalBwrapSandboxProvider:
                 "slot_id": payload.get("slot_id"),
                 "port": payload.get("port"),
                 "generation": payload.get("generation"),
+                **profile_metadata,
             },
             raw=payload,
         )
@@ -218,6 +281,112 @@ class LocalBwrapSandboxProvider:
                 ignore_reinit_error=True,
             )
         return ray.get_actor(self._manager_name, namespace=self._namespace)
+
+
+@asynccontextmanager
+async def _acquire_limit():
+    concurrency = _env_int("DRESSAGE_LOCAL_BWRAP_ACQUIRE_CONCURRENCY", 0, min_value=0)
+    if concurrency <= 0:
+        yield
+        return
+    semaphore = _ACQUIRE_SEMAPHORES.get(concurrency)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(concurrency)
+        _ACQUIRE_SEMAPHORES[concurrency] = semaphore
+    async with semaphore:
+        yield
+
+
+async def _manager_status(manager: Any) -> dict[str, Any] | None:
+    try:
+        return await _remote_call(manager, "status", force_refresh=True)
+    except Exception:
+        return None
+
+
+async def _blackbox_health_ok(base_url: str) -> bool:
+    timeout = _env_float(
+        "DRESSAGE_LOCAL_BWRAP_ACQUIRE_HEALTH_TIMEOUT_SEC",
+        2.0,
+        min_value=0.1,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            response = await client.get(f"{base_url.rstrip('/')}/health")
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return False
+    if isinstance(payload, dict):
+        status = str(payload.get("status") or payload.get("state") or "").upper()
+        if status in {"ERROR", "SHUTTING_DOWN"}:
+            return False
+    return True
+
+
+def _status_profile(prefix: str, status: dict[str, Any] | None) -> dict[str, float]:
+    if not isinstance(status, dict):
+        return {}
+    keys = (
+        "total_capacity",
+        "total_ready",
+        "total_leased",
+        "total_resetting",
+        "total_restarting",
+        "total_failed",
+        "total_lost",
+    )
+    result: dict[str, float] = {}
+    for key in keys:
+        value = status.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            result[f"profile.{prefix}.{key}"] = float(value)
+    leases = status.get("leases")
+    if isinstance(leases, dict):
+        for key in ("active", "releasing", "tracked", "expired", "lost"):
+            value = leases.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[f"profile.{prefix}.leases_{key}"] = float(value)
+    return result
+
+
+def _spec_requests_service(spec: SandboxSpec, service_name: str) -> bool:
+    return any(service.name == service_name for service in spec.services)
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    return value
+
+
+def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _paddock_mode_from_spec(spec: SandboxSpec) -> str:

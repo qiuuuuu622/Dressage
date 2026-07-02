@@ -66,6 +66,10 @@ def _last_segment_sample(result, *, expected_count: int | None = None):
     return result[-1]
 
 
+def _status_value(status):
+    return getattr(status, "value", status)
+
+
 class FakePaddock:
     def __init__(self):
         self.calls = []
@@ -145,6 +149,37 @@ class FailingHttpCallPaddock(FakePaddock):
         )
         raise httpx.HTTPStatusError(
             "Server error '502 Bad Gateway' for url 'http://sandbox.test/v1/sessions/bbs-sess-7/messages'",
+            request=request,
+            response=response,
+        )
+
+
+class BackendErrorCallPaddock(FakePaddock):
+    async def call_agent(self, state, **kwargs):
+        self.calls.append(("call_agent", state, kwargs))
+        request = httpx.Request(
+            "POST",
+            "http://sandbox.test/v1/sessions/bbs-sess-7/messages",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+        response = httpx.Response(
+            502,
+            json={
+                "request_id": "req-backend-error",
+                "error": "backend_error",
+                "message": (
+                    "Backend request failed: Server disconnected without sending a response."
+                ),
+                "details": {
+                    "session_id": "bbs-sess-7",
+                    "turn_id": "turn-backend-error",
+                },
+            },
+            request=request,
+        )
+        raise httpx.HTTPStatusError(
+            "Server error '502 Bad Gateway' for url "
+            "'http://sandbox.test/v1/sessions/bbs-sess-7/messages'",
             request=request,
             response=response,
         )
@@ -764,7 +799,11 @@ async def _run_blackbox_dispatch_prefixes_generated_session_id(monkeypatch):
             },
         },
     )
-    assert paddock.calls[-1] == ("terminate", expected_session_id, {})
+    assert paddock.calls[-1] == (
+        "terminate",
+        expected_session_id,
+        {"blackbox_skip_abort": True},
+    )
     assert sample.metadata["execute_cmds"] == []
     assert not [call for call in paddock.calls if call[0] == "execute_cmd"]
     assert proxy.calls == [
@@ -2207,6 +2246,54 @@ def test_blackbox_dispatch_suppresses_generation_preempted_error_log(
     )
 
 
+def test_blackbox_dispatch_suppresses_backend_error_log(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    asyncio.run(
+        _run_blackbox_dispatch_suppresses_backend_error_log(
+            monkeypatch,
+            tmp_path,
+            caplog,
+        )
+    )
+
+
+async def _run_blackbox_dispatch_suppresses_backend_error_log(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    paddock = BackendErrorCallPaddock()
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", FakeProxy())
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_ERROR_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "await")
+    caplog.set_level(logging.WARNING, logger=blackbox_dispatch.__name__)
+
+    sample = SampleLike()
+    result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert result is sample
+    assert _status_value(sample.status) == "aborted"
+    assert sample.metadata["blackbox_expected_abort"] == "backend_error"
+    assert "blackbox_error" not in sample.metadata
+    assert "blackbox_error_log_path" not in sample.metadata
+    assert "blackbox_failure_history" not in sample.metadata
+
+    error_path = tmp_path / "7" / "bbs-sess-7" / "error.json"
+    assert not error_path.exists()
+
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == blackbox_dispatch.__name__
+    ]
+    assert not any("blackbox rollout failed" in message for message in warning_messages)
+
+
 async def _run_blackbox_dispatch_suppresses_generation_preempted_error_log(
     monkeypatch,
     tmp_path,
@@ -2224,7 +2311,7 @@ async def _run_blackbox_dispatch_suppresses_generation_preempted_error_log(
     await paddock_lifecycle.drain_terminate_tasks()
 
     assert result is sample
-    assert sample.status == SampleLike.Status.ABORTED
+    assert _status_value(sample.status) == "aborted"
     assert sample.metadata["blackbox_expected_abort"] == "generation_preempted"
     assert "blackbox_error" not in sample.metadata
     assert "blackbox_error_log_path" not in sample.metadata
@@ -2254,7 +2341,7 @@ async def _run_blackbox_dispatch_logs_trajectory_error(monkeypatch, tmp_path, ca
     await paddock_lifecycle.drain_terminate_tasks()
 
     assert result is sample
-    assert sample.status == SampleLike.Status.ABORTED
+    assert _status_value(sample.status) == "aborted"
     assert "blackbox_error" in sample.metadata
     assert "blackbox_error_log_path" in sample.metadata
 

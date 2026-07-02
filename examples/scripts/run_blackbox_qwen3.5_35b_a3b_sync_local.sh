@@ -9,6 +9,9 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
+pkill -9 opencode
+pkill -9 bwrap
+sleep 2
 
 set -ex
 
@@ -161,7 +164,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --calculate-per-token-loss
-   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+   --max-tokens-per-gpu 6144
 
    --log-probs-chunk-size 512
    --enable-mtp-training
@@ -193,12 +196,13 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3.5-35B-A3B-mtp-eagle
+   --wandb-group qwen3.5-35B-A3B-mtp-eagle-sync-os1.25-0626
+   --disable-wandb-random-suffix
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.75
+   --sglang-mem-fraction-static 0.8
    --sglang-disable-custom-all-reduce
    --sglang-reasoning-parser qwen3
    --sglang-tool-call-parser qwen3_coder
@@ -207,12 +211,14 @@ SGLANG_ARGS=(
    --sglang-max-prefill-tokens 16384
    --sglang-max-running-requests 256
    --sglang-router-port "${SGLANG_ROUTER_PORT}"
-   --router-policy round_robin
+   --router-policy consistent_hashing     
    --sglang-speculative-algorithm EAGLE
    --sglang-speculative-num-steps 2
    --sglang-speculative-eagle-topk 1
    --sglang-speculative-num-draft-tokens 3
    --sglang-mamba-scheduler-strategy extra_buffer
+  #  --sglang-enable-flashinfer-allreduce-fusion
+   --sglang-mamba-full-memory-ratio 2.0   
    --sglang-enable-metrics
 )
 
@@ -296,6 +302,19 @@ for i in $(seq 1 60); do
 done
 
 export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${PROXY_PUBLIC_HOST},${SGLANG_ROUTER_HOST}"
+
+# Sandbox reset strategy for the local_bwrap pool.
+#   soft = clear runtime dirs only (rmtree+mkdir), reuse the bwrap process  -> fast
+#   hard = stop + reset dirs + RESTART each bwrap process (+health check)   -> slow
+# Must be exported BEFORE `ray start` so the detached LocalBwrap actor inherits it
+# (RUNTIME_ENV_JSON only reaches the train job).
+# Default set to 'hard' per request (cleaner per-rollout isolation).
+# ⚠️ COST: with 512 trajectories/rollout, 'hard' fires 512 concurrent process restarts
+# (no concurrency cap, supervisor.py:_schedule_task) that collide with CPU-offloaded
+# training and can stall the *next* rollout's acquire. Override with
+# DRESSAGE_BLACKBOX_RESET_STRATEGY=soft if throughput suffers.
+export DRESSAGE_BLACKBOX_RESET_STRATEGY="${DRESSAGE_BLACKBOX_RESET_STRATEGY:-hard}"
+
 cd "${SLIME_ROOT}"
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${RAY_NUM_GPUS_PER_NODE}" --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 "${DRESSAGE_BLACKBOX_HEAD_RESOURCE_ARGS[@]}"
 
@@ -326,14 +345,13 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NVTE_FUSED_ATTN": "0",
     "NVTE_FLASH_ATTN": "1",
-    "DRESSAGE_TAIL_BATCH": "${DRESSAGE_TAIL_BATCH:-0}",
-    "DRESSAGE_TAIL_BATCH_HISTORY": "${DRESSAGE_TAIL_BATCH_HISTORY:-/root/model_dist/tail_batch_len_hist.json}",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "DRESSAGE_PROXY_URL": "${DRESSAGE_PROXY_URL}",
     "DRESSAGE_PADDOCK_MODE": "${DRESSAGE_PADDOCK_MODE}",
     "DRESSAGE_SANDBOX_PROVIDER": "${DRESSAGE_SANDBOX_PROVIDER}",
     "DRESSAGE_BLACKBOX_MAX_STEPS": "${DRESSAGE_BLACKBOX_MAX_STEPS}",
     "DRESSAGE_BLACKBOX_COMPACT_THRESHOLD": "${DRESSAGE_BLACKBOX_COMPACT_THRESHOLD}",
+    "DRESSAGE_SYNC_OVERSAMPLE": "${DRESSAGE_SYNC_OVERSAMPLE:-1.25}",
     "DRESSAGE_LOCAL_BWRAP_POOL_MODE": "${DRESSAGE_LOCAL_BWRAP_POOL_MODE}",
     "DRESSAGE_LOCAL_BWRAP_RAY_NAMESPACE": "${DRESSAGE_LOCAL_BWRAP_RAY_NAMESPACE}",
     "DRESSAGE_LOCAL_BWRAP_MANAGER_NAME": "${DRESSAGE_LOCAL_BWRAP_MANAGER_NAME}",

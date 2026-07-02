@@ -603,6 +603,12 @@ class LocalSandboxRunner:
             ]
         )
         bwrap_cmd.extend(self.config.extra_bubblewrap_args)
+        # Cap CPU threads inside the sandbox so model-generated code
+        # (numpy/scipy/BLAS) can't grab all host cores when many sandbox
+        # slots run concurrently. Scoped to the sandbox only; the training
+        # processes (launched via Ray, outside bwrap) are unaffected.
+        for _thr_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            bwrap_cmd.extend(["--setenv", _thr_var, "1"])
         bwrap_cmd.extend(["--", *server_cmd])
 
         return self._maybe_wrap_systemd_scope(slot, bwrap_cmd)
