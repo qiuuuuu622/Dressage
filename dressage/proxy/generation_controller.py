@@ -9,9 +9,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from dressage.profiling import (
+    async_profile_span,
+    enabled as profiling_enabled,
+    profile_add,
+    profile_set,
+)
 
 from .sglang_client import SGLangResponse, SGLangRouterClient
 
@@ -177,6 +185,7 @@ class GenerationController:
         routed_experts_chunks: list[dict[str, Any]] = []
         finish_reason = "stop"
         meta_info: dict[str, Any] = {}
+        profile: dict[str, Any] = {}
         all_logprobs_invalid = False
         rollout_epoch: int | None = None
         expect_input_logprobs = logprob_start_len == 0
@@ -224,14 +233,22 @@ class GenerationController:
                 # returned by this original /generate request after SGLang handles
                 # the abort.  Do not read partial output from abort_request's
                 # response body.
-                response = await self._generate_with_optional_request_id(
-                    list(input_ids) + list(generated_ids),
-                    chunk_sampling_params,
-                    routing_key=routing_key,
-                    request_id=active.request_id,
-                    logprob_start_len=chunk_logprob_start_len,
-                    profile=profile,
-                )
+                async with async_profile_span(profile, "sglang.generate_http_s"):
+                    response = await self._generate_with_optional_request_id(
+                        list(input_ids) + list(generated_ids),
+                        chunk_sampling_params,
+                        routing_key=routing_key,
+                        request_id=active.request_id,
+                        logprob_start_len=chunk_logprob_start_len,
+                        profile=profile,
+                    )
+                if profiling_enabled():
+                    profile_set(
+                        profile,
+                        "sglang.generate_calls",
+                        int(profile.get("sglang.generate_calls", 0)) + 1,
+                    )
+                    profile_add(profile, "sglang.input_tokens", float(request_token_count))
                 forced_preempted = active.abort_succeeded
             except Exception as exc:
                 if self._shutting_down:
@@ -317,6 +334,14 @@ class GenerationController:
             output_versions.extend([version] * len(chunk.output_ids))
             generated_ids.extend(chunk.output_ids)
             text_parts.append(chunk.text)
+            if profiling_enabled():
+                profile["sglang.output_tokens"] = int(
+                    profile.get("sglang.output_tokens", 0)
+                ) + len(chunk.output_ids)
+                if preempted:
+                    profile["sglang.preempted_chunks"] = int(
+                        profile.get("sglang.preempted_chunks", 0)
+                    ) + 1
             if routed_experts is not None and (chunk.output_ids or not preempted):
                 routed_experts_chunks.append(
                     {
@@ -375,6 +400,8 @@ class GenerationController:
         full_input_logprobs = self._normalize_length(input_logprobs, len(input_ids), 0.0)
         full_input_texts = self._normalize_length(input_texts, len(input_ids), "")
         meta_info = dict(meta_info)
+        if profiling_enabled():
+            meta_info["dressage_profile"] = dict(profile)
         meta_info["partial_rollout_chunks"] = [
             {
                 "num_output_tokens": len(chunk.output_ids),

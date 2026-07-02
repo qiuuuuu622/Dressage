@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
+
+from dressage.profiling import async_profile_span, profile_set, profile_span
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,18 @@ ReasoningParser = Callable[[str], ReasoningParseResult]
 
 _LOCAL_REASONING_TYPES = {"qwen3", "qwen3_5"}
 _QWEN_COMPLETION_REPAIR_TYPES = {"qwen3", "qwen3_5", "qwen3-thinking"}
+
+
+def _supports_profile_arg(func: Any) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "profile"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def canonicalize_reasoning_content(value: Any) -> str | None:
@@ -94,14 +109,20 @@ class ProxyReasoningParser:
     def local_model_supported(model_reasoning_type: str | None) -> bool:
         return model_reasoning_type in _LOCAL_REASONING_TYPES
 
-    def _parse_locally(self, raw_text: str) -> ReasoningParseResult:
-        local_parser = get_local_reasoning_parser(self._model_reasoning_type)
-        if local_parser is None:
-            raise ValueError(
-                "local reasoning parser only supports qwen3/qwen3_5, "
-                f"got {self._model_reasoning_type!r}"
-            )
-        return local_parser(raw_text)
+    def _parse_locally(
+        self,
+        raw_text: str,
+        *,
+        profile: dict[str, Any] | None = None,
+    ) -> ReasoningParseResult:
+        with profile_span(profile, "reasoning.parse.local_s"):
+            local_parser = get_local_reasoning_parser(self._model_reasoning_type)
+            if local_parser is None:
+                raise ValueError(
+                    "local reasoning parser only supports qwen3/qwen3_5, "
+                    f"got {self._model_reasoning_type!r}"
+                )
+            return local_parser(raw_text)
 
     @staticmethod
     def _normalize_sglang_result(parsed: dict[str, Any] | None) -> ReasoningParseResult | None:
@@ -128,22 +149,31 @@ class ProxyReasoningParser:
         raw_text: str,
         *,
         routing_key: str | None,
+        profile: dict[str, Any] | None = None,
     ) -> ReasoningParseResult | None:
         if self._model_reasoning_type is None:
             return None
-        parser_text = _repair_qwen_completion_for_sglang_api(
-            raw_text,
-            self._model_reasoning_type,
-        )
-        try:
-            parsed = await self._sglang_client.separate_reasoning(
-                parser_text,
-                reasoning_parser=self._model_reasoning_type,
-                routing_key=routing_key,
+        with profile_span(profile, "reasoning.parse.repair_s"):
+            parser_text = _repair_qwen_completion_for_sglang_api(
+                raw_text,
+                self._model_reasoning_type,
             )
+        try:
+            async with async_profile_span(profile, "reasoning.parse.api_http_s"):
+                kwargs: dict[str, Any] = {
+                    "reasoning_parser": self._model_reasoning_type,
+                    "routing_key": routing_key,
+                }
+                if _supports_profile_arg(self._sglang_client.separate_reasoning):
+                    kwargs["profile"] = profile
+                parsed = await self._sglang_client.separate_reasoning(
+                    parser_text,
+                    **kwargs,
+                )
         except Exception:
             return None
-        result = self._normalize_sglang_result(parsed)
+        with profile_span(profile, "reasoning.parse.normalize_s"):
+            result = self._normalize_sglang_result(parsed)
         if (
             result is not None
             and result.reasoning_content is None
@@ -161,22 +191,35 @@ class ProxyReasoningParser:
         raw_text: str,
         *,
         routing_key: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> ReasoningParseResult:
+        profile_set(profile, "reasoning.parse.backend.local", float(self._backend == "local"))
+        profile_set(
+            profile,
+            "reasoning.parse.backend.sglang_api",
+            float(self._backend == "sglang_api"),
+        )
+        profile_set(profile, "reasoning.parse.backend.hybrid", float(self._backend == "hybrid"))
         if self._model_reasoning_type is None:
             return ReasoningParseResult(reasoning_content=None, text=raw_text)
 
         if self._backend == "local":
-            return self._parse_locally(raw_text)
+            return self._parse_locally(raw_text, profile=profile)
 
         if self._backend == "sglang_api":
             return (
-                await self._parse_with_sglang_api(raw_text, routing_key=routing_key)
+                await self._parse_with_sglang_api(
+                    raw_text, routing_key=routing_key, profile=profile
+                )
             ) or ReasoningParseResult(reasoning_content=None, text=raw_text)
 
-        parsed = await self._parse_with_sglang_api(raw_text, routing_key=routing_key)
+        parsed = await self._parse_with_sglang_api(
+            raw_text, routing_key=routing_key, profile=profile
+        )
         if parsed is not None:
             return parsed
         local_parser = get_local_reasoning_parser(self._model_reasoning_type)
         if local_parser is None:
             return ReasoningParseResult(reasoning_content=None, text=raw_text)
-        return local_parser(raw_text)
+        with profile_span(profile, "reasoning.parse.hybrid_local_fallback_s"):
+            return local_parser(raw_text)

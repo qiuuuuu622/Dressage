@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from dressage.profiling import (
+    async_profile_span,
+    profile_add,
+    profile_set,
+    profile_span,
+)
+
 from .tool_call_ids import new_openai_tool_call_id
 
-ToolCallParser = Callable[[str], tuple[str | None, list[dict] | None]]
+ToolCallParser = Callable[..., tuple[str | None, list[dict] | None]]
 
 _HERMES_TOOL_CALL_PATTERN = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
@@ -23,6 +31,18 @@ _QWEN_FUNCTION_PATTERN = re.compile(
 _QWEN_PARAMETER_PATTERN = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", re.DOTALL
 )
+
+
+def _supports_profile_arg(func: Any) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "profile"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _strip_blank_content(text: str | None) -> str | None:
@@ -49,42 +69,71 @@ def _build_openai_tool_call(
     }
 
 
-def _clean_text_without_spans(text: str, spans: list[tuple[int, int]]) -> str | None:
+def _clean_text_without_spans(
+    text: str,
+    spans: list[tuple[int, int]],
+    *,
+    profile: dict[str, Any] | None = None,
+    profile_prefix: str = "tool.parse.clean_content",
+) -> str | None:
     if not spans:
         return text
-    pieces: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        if cursor < start:
-            pieces.append(text[cursor:start])
-        cursor = end
-    if cursor < len(text):
-        pieces.append(text[cursor:])
-    return _strip_blank_content("".join(pieces))
+    with profile_span(profile, f"{profile_prefix}_s"):
+        pieces: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            if cursor < start:
+                pieces.append(text[cursor:start])
+            cursor = end
+        if cursor < len(text):
+            pieces.append(text[cursor:])
+        return _strip_blank_content("".join(pieces))
 
 
-def parse_hermes_tool_calls(text: str) -> tuple[str | None, list[dict] | None]:
+def parse_hermes_tool_calls(
+    text: str,
+    *,
+    profile: dict[str, Any] | None = None,
+) -> tuple[str | None, list[dict] | None]:
     """Extract Hermes-style ``<tool_call>`` JSON blocks from raw text."""
+
+    with profile_span(profile, "tool.parse.hermes.sentinel_s"):
+        has_tool_marker = "<tool_call" in text and "</tool_call>" in text
+    if not has_tool_marker:
+        return text, None
 
     tool_calls: list[dict[str, Any]] = []
     parsed_spans: list[tuple[int, int]] = []
-    for match in _HERMES_TOOL_CALL_PATTERN.finditer(text):
-        try:
-            parsed = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        tool_calls.append(
-            _build_openai_tool_call(
-                index=len(tool_calls),
-                name=parsed.get("name", ""),
-                arguments=parsed.get("arguments", {}),
+    with profile_span(profile, "tool.parse.hermes.regex_scan_s"):
+        matches = list(_HERMES_TOOL_CALL_PATTERN.finditer(text))
+    profile_add(profile, "tool.parse.hermes.block_count", float(len(matches)))
+    for match in matches:
+        with profile_span(profile, "tool.parse.hermes.json_loads_s"):
+            try:
+                parsed = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+        with profile_span(profile, "tool.parse.hermes.build_calls_s"):
+            tool_calls.append(
+                _build_openai_tool_call(
+                    index=len(tool_calls),
+                    name=parsed.get("name", ""),
+                    arguments=parsed.get("arguments", {}),
+                )
             )
-        )
         parsed_spans.append(match.span())
 
     if not tool_calls:
         return text, None
-    return _clean_text_without_spans(text, parsed_spans), tool_calls
+    return (
+        _clean_text_without_spans(
+            text,
+            parsed_spans,
+            profile=profile,
+            profile_prefix="tool.parse.hermes.clean_content",
+        ),
+        tool_calls,
+    )
 
 
 def _parse_qwen_parameter_value(raw_value: str) -> Any:
@@ -97,35 +146,62 @@ def _parse_qwen_parameter_value(raw_value: str) -> Any:
         return value
 
 
-def parse_qwen3_5_tool_calls(text: str) -> tuple[str | None, list[dict] | None]:
+def parse_qwen3_5_tool_calls(
+    text: str,
+    *,
+    profile: dict[str, Any] | None = None,
+) -> tuple[str | None, list[dict] | None]:
     """Extract Qwen 3.5 XML-style tool calls from raw text."""
+
+    with profile_span(profile, "tool.parse.qwen.sentinel_s"):
+        has_tool_marker = "<tool_call" in text and "</tool_call>" in text
+    if not has_tool_marker:
+        return text, None
 
     tool_calls: list[dict[str, Any]] = []
     parsed_spans: list[tuple[int, int]] = []
 
-    for block_match in _QWEN_TOOL_CALL_BLOCK_PATTERN.finditer(text):
+    with profile_span(profile, "tool.parse.qwen.block_regex_scan_s"):
+        block_matches = list(_QWEN_TOOL_CALL_BLOCK_PATTERN.finditer(text))
+    profile_add(profile, "tool.parse.qwen.block_count", float(len(block_matches)))
+
+    for block_match in block_matches:
         block_body = block_match.group(1)
         parsed_in_block: list[dict[str, Any]] = []
-        for function_match in _QWEN_FUNCTION_PATTERN.finditer(block_body):
+        with profile_span(profile, "tool.parse.qwen.function_regex_scan_s"):
+            function_matches = list(_QWEN_FUNCTION_PATTERN.finditer(block_body))
+        profile_add(
+            profile, "tool.parse.qwen.function_count", float(len(function_matches))
+        )
+        for function_match in function_matches:
             function_name = function_match.group(1).strip()
             if not function_name:
                 continue
             parameters: dict[str, Any] = {}
             function_body = function_match.group(2)
-            for parameter_match in _QWEN_PARAMETER_PATTERN.finditer(function_body):
+            with profile_span(profile, "tool.parse.qwen.parameter_regex_scan_s"):
+                parameter_matches = list(_QWEN_PARAMETER_PATTERN.finditer(function_body))
+            profile_add(
+                profile,
+                "tool.parse.qwen.parameter_count",
+                float(len(parameter_matches)),
+            )
+            for parameter_match in parameter_matches:
                 parameter_name = parameter_match.group(1).strip()
                 if not parameter_name:
                     continue
-                parameters[parameter_name] = _parse_qwen_parameter_value(
-                    parameter_match.group(2)
+                with profile_span(profile, "tool.parse.qwen.parameter_value_s"):
+                    parameters[parameter_name] = _parse_qwen_parameter_value(
+                        parameter_match.group(2)
+                    )
+            with profile_span(profile, "tool.parse.qwen.build_calls_s"):
+                parsed_in_block.append(
+                    _build_openai_tool_call(
+                        index=len(tool_calls) + len(parsed_in_block),
+                        name=function_name,
+                        arguments=parameters,
+                    )
                 )
-            parsed_in_block.append(
-                _build_openai_tool_call(
-                    index=len(tool_calls) + len(parsed_in_block),
-                    name=function_name,
-                    arguments=parameters,
-                )
-            )
 
         if not parsed_in_block:
             continue
@@ -134,7 +210,15 @@ def parse_qwen3_5_tool_calls(text: str) -> tuple[str | None, list[dict] | None]:
 
     if not tool_calls:
         return text, None
-    return _clean_text_without_spans(text, parsed_spans), tool_calls
+    return (
+        _clean_text_without_spans(
+            text,
+            parsed_spans,
+            profile=profile,
+            profile_prefix="tool.parse.qwen.clean_content",
+        ),
+        tool_calls,
+    )
 
 
 @dataclass(frozen=True)
@@ -262,6 +346,7 @@ class ProxyToolCallParser:
         tools: list[dict] | None,
         *,
         routing_key: str | None,
+        profile: dict[str, Any] | None = None,
     ) -> tuple[str | None, list[dict] | None] | None:
         if not tools:
             return None
@@ -269,24 +354,36 @@ class ProxyToolCallParser:
         if parser_name is None:
             return None
         try:
-            parsed = await self._sglang_client.parse_function_call(
-                raw_text,
-                tool_call_parser=parser_name,
-                tools=tools,
-                routing_key=routing_key,
-            )
+            async with async_profile_span(profile, "tool.parse.api_http_s"):
+                kwargs: dict[str, Any] = {
+                    "tool_call_parser": parser_name,
+                    "tools": tools,
+                    "routing_key": routing_key,
+                }
+                if _supports_profile_arg(self._sglang_client.parse_function_call):
+                    kwargs["profile"] = profile
+                parsed = await self._sglang_client.parse_function_call(
+                    raw_text,
+                    **kwargs,
+                )
         except Exception:
             return None
-        return self._normalize_sglang_result(parsed)
+        with profile_span(profile, "tool.parse.api_normalize_s"):
+            return self._normalize_sglang_result(parsed)
 
     def _parse_locally(
         self,
         raw_text: str,
+        *,
+        profile: dict[str, Any] | None = None,
     ) -> tuple[str | None, list[dict] | None]:
-        local_parser = self._resolve_local_parser()
-        if local_parser is None:
-            return raw_text, None
-        return local_parser(raw_text)
+        with profile_span(profile, "tool.parse.local_s"):
+            local_parser = self._resolve_local_parser()
+            if local_parser is None:
+                return raw_text, None
+            if local_parser in {parse_hermes_tool_calls, parse_qwen3_5_tool_calls}:
+                return local_parser(raw_text, profile=profile)
+            return local_parser(raw_text)
 
     async def parse(
         self,
@@ -294,23 +391,31 @@ class ProxyToolCallParser:
         tools: list[dict] | None,
         *,
         routing_key: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> tuple[str | None, list[dict] | None]:
+        profile_set(profile, "tool.parse.backend.local", float(self._backend == "local"))
+        profile_set(
+            profile,
+            "tool.parse.backend.sglang_api",
+            float(self._backend == "sglang_api"),
+        )
+        profile_set(profile, "tool.parse.backend.hybrid", float(self._backend == "hybrid"))
         if self._legacy_local_parser is not None:
-            return self._parse_locally(raw_text)
+            return self._parse_locally(raw_text, profile=profile)
 
         if self._backend == "local":
-            return self._parse_locally(raw_text)
+            return self._parse_locally(raw_text, profile=profile)
 
         if self._backend == "sglang_api":
             return (
                 await self._parse_with_sglang_api(
-                    raw_text, tools, routing_key=routing_key
+                    raw_text, tools, routing_key=routing_key, profile=profile
                 )
             ) or (raw_text, None)
 
         parsed = await self._parse_with_sglang_api(
-            raw_text, tools, routing_key=routing_key
+            raw_text, tools, routing_key=routing_key, profile=profile
         )
         if parsed is not None:
             return parsed
-        return self._parse_locally(raw_text)
+        return self._parse_locally(raw_text, profile=profile)

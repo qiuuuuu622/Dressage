@@ -10,10 +10,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import httpx
 
-
-def _profile_add(profile: dict[str, Any] | None, key: str, seconds: float) -> None:
-    if profile is not None:
-        profile[key] = float(profile.get(key, 0.0)) + float(seconds)
+from dressage.profiling import async_profile_span, profile_add, profile_span
 
 
 def _coerce_int_list(values: Any) -> list[int]:
@@ -190,42 +187,38 @@ class SGLangRouterClient:
         request_id: str | None = None,
         profile: dict[str, Any] | None = None,
     ) -> SGLangResponse:
-        started = time.perf_counter()
-        payload = {
-            "input_ids": input_ids,
-            "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
-            "logprob_start_len": logprob_start_len,
-            "return_text_in_logprobs": True,
-        }
-        if return_routed_experts or self._return_routed_experts:
-            payload["return_routed_experts"] = True
-        if request_id:
-            # SGLang request-level abort is keyed by rid.  Keep the public
-            # Python parameter name request_id because the rest of Dressage and
-            # blackbox server use that terminology.
-            payload["rid"] = request_id
-        headers = {}
-        if routing_key:
-            headers["X-SMG-Routing-Key"] = routing_key
-        _profile_add(profile, "sglang.client_generate_request_build_s", time.perf_counter() - started)
+        with profile_span(profile, "sglang.client_generate_request_build_s"):
+            payload = {
+                "input_ids": input_ids,
+                "sampling_params": sampling_params,
+                "return_logprob": return_logprob,
+                "logprob_start_len": logprob_start_len,
+                "return_text_in_logprobs": True,
+            }
+            if return_routed_experts or self._return_routed_experts:
+                payload["return_routed_experts"] = True
+            if request_id:
+                # SGLang request-level abort is keyed by rid.  Keep the public
+                # Python parameter name request_id because the rest of Dressage and
+                # blackbox server use that terminology.
+                payload["rid"] = request_id
+            headers = {}
+            if routing_key:
+                headers["X-SMG-Routing-Key"] = routing_key
 
-        post_started = time.perf_counter()
-        response = await self._client.post(
-            f"{self._router_url}/generate", json=payload, headers=headers
-        )
-        _profile_add(profile, "sglang.client_generate_post_s", time.perf_counter() - post_started)
+        async with async_profile_span(profile, "sglang.client_generate_post_s"):
+            response = await self._client.post(
+                f"{self._router_url}/generate", json=payload, headers=headers
+            )
         response.raise_for_status()
-        json_started = time.perf_counter()
-        data = response.json()
-        _profile_add(profile, "sglang.client_generate_json_parse_s", time.perf_counter() - json_started)
-        coerce_started = time.perf_counter()
-        result = self._coerce_response(
-            data,
-            input_ids=input_ids,
-            expect_input_logprobs=bool(return_logprob and logprob_start_len == 0),
-        )
-        _profile_add(profile, "sglang.client_generate_coerce_s", time.perf_counter() - coerce_started)
+        with profile_span(profile, "sglang.client_generate_json_parse_s"):
+            data = response.json()
+        with profile_span(profile, "sglang.client_generate_coerce_s"):
+            result = self._coerce_response(
+                data,
+                input_ids=input_ids,
+                expect_input_logprobs=bool(return_logprob and logprob_start_len == 0),
+            )
         return result
 
     async def abort_request(
@@ -441,13 +434,18 @@ class SGLangRouterClient:
         parser: str | None = None,
         tools: list[dict] | None,
         routing_key: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         parser_name = tool_call_parser or parser
         if not parser_name:
             return None
 
+        profile_add(profile, "sglang.parse_function_call.text_chars", float(len(text)))
         try:
-            workers = await self.list_workers()
+            async with async_profile_span(
+                profile, "sglang.parse_function_call.list_workers_s"
+            ):
+                workers = await self.list_workers()
         except Exception:
             return None
 
@@ -464,13 +462,17 @@ class SGLangRouterClient:
                 payload["tools"] = tools
 
             try:
-                response = await self._client.post(
-                    f"{worker.url}/parse_function_call",
-                    json=payload,
-                    headers=headers,
-                )
+                async with async_profile_span(
+                    profile, "sglang.parse_function_call.post_s"
+                ):
+                    response = await self._client.post(
+                        f"{worker.url}/parse_function_call",
+                        json=payload,
+                        headers=headers,
+                    )
                 response.raise_for_status()
-                data = response.json()
+                with profile_span(profile, "sglang.parse_function_call.json_parse_s"):
+                    data = response.json()
             except Exception:
                 continue
 
@@ -495,13 +497,18 @@ class SGLangRouterClient:
         reasoning_parser: str | None = None,
         parser: str | None = None,
         routing_key: str | None = None,
+        profile: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         parser_name = reasoning_parser or parser
         if not parser_name:
             return None
 
+        profile_add(profile, "sglang.separate_reasoning.text_chars", float(len(text)))
         try:
-            workers = await self.list_workers()
+            async with async_profile_span(
+                profile, "sglang.separate_reasoning.list_workers_s"
+            ):
+                workers = await self.list_workers()
         except Exception:
             return None
 
@@ -516,13 +523,17 @@ class SGLangRouterClient:
             }
 
             try:
-                response = await self._client.post(
-                    f"{worker.url}/separate_reasoning",
-                    json=payload,
-                    headers=headers,
-                )
+                async with async_profile_span(
+                    profile, "sglang.separate_reasoning.post_s"
+                ):
+                    response = await self._client.post(
+                        f"{worker.url}/separate_reasoning",
+                        json=payload,
+                        headers=headers,
+                    )
                 response.raise_for_status()
-                data = response.json()
+                with profile_span(profile, "sglang.separate_reasoning.json_parse_s"):
+                    data = response.json()
             except Exception:
                 continue
 

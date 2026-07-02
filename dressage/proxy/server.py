@@ -24,7 +24,14 @@ from dressage.config import (
     sglang_router_url as default_sglang_router_url,
     trajectory_build_defaults,
 )
-from dressage.profiling import enabled as profiling_enabled
+from dressage.profiling import (
+    async_profile_span,
+    enabled as profiling_enabled,
+    profile_add,
+    profile_public,
+    profile_span,
+    profile_set,
+)
 
 from .generation_controller import (
     GenerationController,
@@ -53,24 +60,6 @@ logger = logging.getLogger(__name__)
 _INPUT_TOKEN_VERSION = "-1"
 _DEFAULT_TOOL_CALL_PARSER = object()
 _NON_REAL_TOKEN_VERSIONS = {"", "-1", "unknown", "none"}
-
-
-def _profile_add(profile: dict[str, Any], key: str, seconds: float) -> None:
-    if profiling_enabled():
-        profile[key] = float(profile.get(key, 0.0)) + float(seconds)
-
-
-def _profile_set(profile: dict[str, Any], key: str, value: Any) -> None:
-    if profiling_enabled():
-        profile[key] = value
-
-
-def _profile_public(profile: dict[str, Any]) -> dict[str, float]:
-    return {
-        str(key): float(value)
-        for key, value in profile.items()
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    }
 
 
 def _canonical_json(value: Any) -> str:
@@ -583,6 +572,8 @@ def create_app(
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
         }
+        if base_step.profile:
+            extra_info["dressage_profile"] = dict(base_step.profile)
         if alignment["mask_fallback_reason"] is not None:
             extra_info["mask_fallback_reason"] = alignment["mask_fallback_reason"]
         if mask_nonlast_version_tokens:
@@ -702,6 +693,8 @@ def create_app(
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
         }
+        if base_step.profile:
+            extra_info["dressage_profile"] = dict(base_step.profile)
         if concat_logprobs_invalid:
             extra_info["concat_logprobs_invalid"] = True
         if concat_incremental_tokenization_failed:
@@ -952,7 +945,7 @@ def create_app(
             "total_tokens": prompt_tokens + completion_tokens,
         }
         if profile:
-            usage["profile"] = _profile_public(profile)
+            usage["profile"] = profile_public(profile)
         return {
             "id": response_id or f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
@@ -996,8 +989,12 @@ def create_app(
 
         def _usage_chunk() -> str:
             if profile is not None and profiling_enabled():
-                profile["chat.stream_emit_s"] = time.perf_counter() - stream_started
-                profile["chat.stream_chunk_count"] = float(chunk_count)
+                profile_set(
+                    profile,
+                    "chat.stream_emit_s",
+                    time.perf_counter() - stream_started,
+                )
+                profile_set(profile, "chat.stream_chunk_count", float(chunk_count))
             data = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -1011,7 +1008,7 @@ def create_app(
                 },
             }
             if profile:
-                data["usage"]["profile"] = _profile_public(profile)
+                data["usage"]["profile"] = profile_public(profile)
             return f"data: {json.dumps(data)}\n\n"
 
         yield _chunk({"role": "assistant"})
@@ -1091,7 +1088,7 @@ def create_app(
         session_id = session.session_id
         lock_wait_started = time.perf_counter() if profiling_enabled() else 0.0
         async with session.request_lock:
-            _profile_add(
+            profile_add(
                 chat_profile,
                 "chat.session_lock_wait_s",
                 time.perf_counter() - lock_wait_started,
@@ -1223,28 +1220,23 @@ def create_app(
                 partial_rollout=partial_rollout,
             )
             try:
-                generation_started = time.perf_counter() if profiling_enabled() else 0.0
-                router_response = await generation_controller.generate_preemptible(
-                    input_ids=input_ids,
-                    sampling_params=sampling_params,
-                    session_id=session_id,
-                    instance_id=instance_id,
-                    turn_id=effective_turn_id,
-                    routing_key=session_id,
-                    expected_version=expected_version,
-                    expected_epoch=(
-                        request_rollout_epoch
-                        if (not partial_rollout and session.steps)
-                        else None
-                    ),
-                    logprob_start_len=request_logprob_start_len,
-                    context_window=context_window,
-                )
-                _profile_add(
-                    chat_profile,
-                    "chat.generation_s",
-                    time.perf_counter() - generation_started,
-                )
+                async with async_profile_span(chat_profile, "chat.generation_s"):
+                    router_response = await generation_controller.generate_preemptible(
+                        input_ids=input_ids,
+                        sampling_params=sampling_params,
+                        session_id=session_id,
+                        instance_id=instance_id,
+                        turn_id=effective_turn_id,
+                        routing_key=session_id,
+                        expected_version=expected_version,
+                        expected_epoch=(
+                            request_rollout_epoch
+                            if (not partial_rollout and session.steps)
+                            else None
+                        ),
+                        logprob_start_len=request_logprob_start_len,
+                        context_window=context_window,
+                    )
             except GenerationStaleEpoch as exc:
                 logger.warning(
                     "reject non-partial rollout: error=trajectory_version_changed "
@@ -1337,28 +1329,26 @@ def create_app(
                 tool_calls = None
                 reasoning_content = None
             else:
-                reasoning_started = time.perf_counter() if profiling_enabled() else 0.0
-                reasoning_result = await proxy_reasoning_parser.parse(
-                    raw_text,
-                    routing_key=session_id,
-                )
-                _profile_add(
-                    chat_profile,
-                    "chat.reasoning_parse_s",
-                    time.perf_counter() - reasoning_started,
-                )
+                profile_set(chat_profile, "chat.raw_text_chars", float(len(raw_text)))
+                async with async_profile_span(chat_profile, "chat.reasoning_parse_s"):
+                    reasoning_result = await proxy_reasoning_parser.parse(
+                        raw_text,
+                        routing_key=session_id,
+                        profile=chat_profile,
+                    )
                 reasoning_content = reasoning_result.reasoning_content
-                tool_started = time.perf_counter() if profiling_enabled() else 0.0
-                content, tool_calls = await proxy_tool_call_parser.parse(
-                    reasoning_result.text,
-                    tools,
-                    routing_key=session_id,
-                )
-                _profile_add(
+                profile_set(
                     chat_profile,
-                    "chat.tool_parse_s",
-                    time.perf_counter() - tool_started,
+                    "chat.visible_text_chars",
+                    float(len(reasoning_result.text)),
                 )
+                async with async_profile_span(chat_profile, "chat.tool_parse_s"):
+                    content, tool_calls = await proxy_tool_call_parser.parse(
+                        reasoning_result.text,
+                        tools,
+                        routing_key=session_id,
+                        profile=chat_profile,
+                    )
                 content = _strip_public_stop_markers(content)
                 if tool_calls:
                     finish_reason = "tool_calls"
@@ -1419,46 +1409,42 @@ def create_app(
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         chat_profile[str(key)] = float(value)
 
-            record_started = time.perf_counter() if profiling_enabled() else 0.0
-            session_manager.record_step(
-                session_id=session_id,
-                turn_id=effective_turn_id,
-                request_messages=messages,
-                normalized_request_messages=normalized_request_messages,
-                prompt_token_ids=input_ids,
-                prompt_token_logprobs=list(router_response.input_token_logprobs_raw),
-                snapshot_token_ids=snapshot_token_ids,
-                response_token_ids=recorded_response_token_ids,
-                response_logprobs=recorded_response_logprobs,
-                response_versions=recorded_response_versions,
-                all_token_ids=recorded_all_token_ids,
-                all_logprobs=recorded_all_logprobs,
-                all_versions=recorded_all_versions,
-                prompt_versions=prompt_versions,
-                input_token_texts=list(router_response.input_token_texts),
-                output_token_texts=recorded_output_token_texts,
-                messages=full_messages,
-                raw_response_text=recorded_raw_text,
-                all_logprobs_invalid=router_response.all_logprobs_invalid,
-                **concat_payload,
-                response_routed_experts=router_response.routed_experts,
-                response_routed_experts_chunks=router_response.routed_experts_chunks,
-                tools=tools,
-                segment_boundary_before=segment_boundary_before,
-                rewrite_reason=rewrite_reason,
-                segment_reason_before=(
-                    segment_reasons_before[0] if segment_reasons_before else None
-                ),
-                segment_reasons_before=segment_reasons_before,
-                finish_reason=finish_reason,
-                request_version=str(request_version),
-                response_version=str(response_version),
-            )
-            _profile_add(
-                chat_profile,
-                "chat.record_step_s",
-                time.perf_counter() - record_started,
-            )
+            with profile_span(chat_profile, "chat.record_step_s"):
+                session_manager.record_step(
+                    session_id=session_id,
+                    turn_id=effective_turn_id,
+                    request_messages=messages,
+                    normalized_request_messages=normalized_request_messages,
+                    prompt_token_ids=input_ids,
+                    prompt_token_logprobs=list(router_response.input_token_logprobs_raw),
+                    snapshot_token_ids=snapshot_token_ids,
+                    response_token_ids=recorded_response_token_ids,
+                    response_logprobs=recorded_response_logprobs,
+                    response_versions=recorded_response_versions,
+                    all_token_ids=recorded_all_token_ids,
+                    all_logprobs=recorded_all_logprobs,
+                    all_versions=recorded_all_versions,
+                    prompt_versions=prompt_versions,
+                    input_token_texts=list(router_response.input_token_texts),
+                    output_token_texts=recorded_output_token_texts,
+                    messages=full_messages,
+                    raw_response_text=recorded_raw_text,
+                    all_logprobs_invalid=router_response.all_logprobs_invalid,
+                    **concat_payload,
+                    response_routed_experts=router_response.routed_experts,
+                    response_routed_experts_chunks=router_response.routed_experts_chunks,
+                    profile=router_response.meta_info.get("dressage_profile") or {},
+                    tools=tools,
+                    segment_boundary_before=segment_boundary_before,
+                    rewrite_reason=rewrite_reason,
+                    segment_reason_before=(
+                        segment_reasons_before[0] if segment_reasons_before else None
+                    ),
+                    segment_reasons_before=segment_reasons_before,
+                    finish_reason=finish_reason,
+                    request_version=str(request_version),
+                    response_version=str(response_version),
+                )
 
             if output_overflow:
                 details = dict(context_overflow)
@@ -1485,10 +1471,10 @@ def create_app(
                 )
 
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        _profile_set(chat_profile, "chat.prompt_tokens", float(prompt_tokens))
-        _profile_set(chat_profile, "chat.completion_tokens", float(public_completion_tokens))
-        _profile_set(chat_profile, "chat.tool_call_count", float(len(tool_calls or [])))
-        _profile_add(chat_profile, "chat.total_s", time.perf_counter() - chat_started)
+        profile_set(chat_profile, "chat.prompt_tokens", float(prompt_tokens))
+        profile_set(chat_profile, "chat.completion_tokens", float(public_completion_tokens))
+        profile_set(chat_profile, "chat.tool_call_count", float(len(tool_calls or [])))
+        profile_add(chat_profile, "chat.total_s", time.perf_counter() - chat_started)
         if stream:
             return StreamingResponse(
                 _pseudo_stream_chunks(
@@ -1535,11 +1521,19 @@ def create_app(
 
         session = session_manager.get_session(session_id)
         if session is None:
+            finalized = session_manager.get_finalized_session_metadata(session_id)
+            if finalized is not None:
+                finalized["mode"] = "already_finalized"
+                return finalized
             raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
         async with session.request_lock:
             session = session_manager.finalize_session(session_id)
             if session is None:
+                finalized = session_manager.get_finalized_session_metadata(session_id)
+                if finalized is not None:
+                    finalized["mode"] = "already_finalized"
+                    return finalized
                 raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
             if not session.steps:
                 raise HTTPException(status_code=400, detail="Session has no turns")
@@ -1566,20 +1560,24 @@ def create_app(
                     )
                 )
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "trajectory_id": trajectory_id,
-            "instance_id": effective_instance_id,
-            "num_steps": len(session.steps),
-            "num_turns": len(session.turn_ids),
-            "num_segments": segment_count,
-            "history_rewritten": session.history_rewritten,
-            "trajectory_build_mode": trajectory_build_mode,
-            "trajectory_build_model": trajectory_build_model,
-            "record_token_versions": record_token_versions,
-            "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
-        }
+            finalized_payload = {
+                "success": True,
+                "session_id": session_id,
+                "trajectory_id": trajectory_id,
+                "instance_id": effective_instance_id,
+                "num_steps": len(session.steps),
+                "num_turns": len(session.turn_ids),
+                "num_segments": segment_count,
+                "history_rewritten": session.history_rewritten,
+                "mode": "finalized",
+                "trajectory_build_mode": trajectory_build_mode,
+                "trajectory_build_model": trajectory_build_model,
+                "record_token_versions": record_token_versions,
+                "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
+            }
+            session_manager.set_finalized_session_metadata(session_id, finalized_payload)
+
+        return finalized_payload
 
     @app.post("/trajectory/read")
     async def trajectory_read(request: Request):
