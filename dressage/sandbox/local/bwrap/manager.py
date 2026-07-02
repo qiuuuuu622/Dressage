@@ -250,10 +250,12 @@ class LocalBwrapClusterManagerCore:
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.acquire_timeout_sec
         env_args = env_args or {}
+        refresh_attempted = False
         while True:
             if self._closed:
                 raise RuntimeError("local_bwrap cluster manager is shut down")
             node: NodeRecord | None = None
+            needs_refresh = False
             async with self._lock:
                 if self._closed:
                     raise RuntimeError("local_bwrap cluster manager is shut down")
@@ -269,10 +271,21 @@ class LocalBwrapClusterManagerCore:
                 else:
                     if existing is not None:
                         self._drop_lease_locked(existing)
-                    await self._refresh_nodes_if_needed_locked(force=False)
-                    node = self._select_node_locked()
-                    if node is not None:
-                        node.pending_acquires += 1
+                    elapsed = time.time() - self._last_refresh_ts
+                    if (
+                        not refresh_attempted
+                        and elapsed >= self.status_refresh_interval_sec
+                    ):
+                        needs_refresh = True
+                    else:
+                        node = self._select_node_locked()
+                        if node is not None:
+                            node.pending_acquires += 1
+
+            if needs_refresh:
+                await self._refresh_nodes_outside_lock(force=True)
+                refresh_attempted = True
+                continue
 
             if node is not None:
                 try:
@@ -354,6 +367,7 @@ class LocalBwrapClusterManagerCore:
 
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"no local_bwrap {self.pool_mode} slot available")
+            refresh_attempted = False
             await asyncio.sleep(self.acquire_poll_interval_sec)
 
     async def release(

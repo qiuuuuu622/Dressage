@@ -482,6 +482,44 @@ async def _run_cluster_manager_release_is_not_blocked_by_slow_health_refresh():
     assert released["slot_reusable"] is False
 
 
+def test_cluster_manager_release_is_not_blocked_by_acquire_health_refresh():
+    asyncio.run(_run_cluster_manager_release_is_not_blocked_by_acquire_health_refresh())
+
+
+async def _run_cluster_manager_release_is_not_blocked_by_acquire_health_refresh():
+    manager = LocalBwrapClusterManagerCore(
+        acquire_timeout_sec=0.2,
+        acquire_poll_interval_sec=0.001,
+        status_refresh_interval_sec=0,
+    )
+    supervisor = BlockingHealthSupervisor(
+        node_id="node-a", node_ip="10.0.0.10", capacity=2, ready=2
+    )
+    supervisor.block_health = False
+    await manager.add_supervisor(
+        node_id="node-a",
+        node_ip=supervisor.node_ip,
+        capacity=supervisor.capacity,
+        supervisor=supervisor,
+    )
+
+    held = await manager.acquire("traj-held")
+    supervisor.ready = 1
+    supervisor.block_health = True
+    acquire_task = asyncio.create_task(manager.acquire("traj-refresh"))
+    await asyncio.wait_for(supervisor.health_started.wait(), timeout=0.05)
+
+    released = await asyncio.wait_for(
+        manager.release("traj-held", held["lease_id"]), timeout=0.05
+    )
+
+    supervisor.health_can_finish.set()
+    acquired = await asyncio.wait_for(acquire_task, timeout=0.2)
+
+    assert released["release_queued"] is True
+    assert acquired["trajectory_id"] == "traj-refresh"
+
+
 def test_cluster_manager_shutdown_stops_supervisors_and_blocks_acquire():
     asyncio.run(_run_cluster_manager_shutdown_stops_supervisors_and_blocks_acquire())
 
