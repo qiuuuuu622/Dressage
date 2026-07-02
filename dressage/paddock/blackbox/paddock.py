@@ -20,9 +20,12 @@ from dressage.paddock.blackbox.common.defaults import (
 )
 from dressage.paddock.blackbox.common.state import SandboxState
 from dressage.paddock.blackbox.common.utils import (
+    _env_float,
+    _env_int,
+    _exception_summary,
+    _jittered_delay,
     _require_public_proxy_url,
     _validate_public_proxy_url,
-    _env_int,
 )
 from dressage.paddock.interface import BlackboxPaddock
 from dressage.sandbox import SandboxEndpoint, SandboxLease, SandboxServiceSpec, SandboxSpec
@@ -154,7 +157,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         async with _register_limit():
             for attempt in range(recycle_attempts + 1):
                 try:
-                    result = await self._register_agent_once(
+                    result = await self._register_agent_with_transport_retries(
                         state,
                         instance_id=instance_id,
                         session_id=session_id,
@@ -163,6 +166,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
                         backend_options=merged_backend_options,
                         server_config=server_config,
                         router_api_path=router_api_path,
+                        recycle_attempt=attempt,
                     )
                     _set_lease_profile_value(
                         state,
@@ -173,29 +177,111 @@ class BlackboxAgentPaddock(BlackboxPaddock):
                 except httpx.HTTPStatusError as exc:
                     if not _should_recycle_register_error(exc) or attempt >= recycle_attempts:
                         raise
+                    context = self._register_log_context(state)
                     logger.warning(
                         "register_agent failed with retryable status=%s for trajectory_id=%s; "
-                        "recycling sandbox slot (%d/%d)",
+                        "recycling sandbox slot (%d/%d) endpoint=%s sandbox_id=%s "
+                        "slot_id=%s generation=%s",
                         exc.response.status_code,
                         state.trajectory_id,
                         attempt + 1,
                         recycle_attempts,
+                        context["endpoint"],
+                        context["sandbox_id"],
+                        context["slot_id"],
+                        context["generation"],
                     )
                     state = await self._recycle_state_for_register(state)
                 except _REGISTER_RECYCLE_ERRORS as exc:
                     if attempt >= recycle_attempts:
                         raise
+                    context = self._register_log_context(state)
                     logger.warning(
                         "register_agent transport failure for trajectory_id=%s; "
-                        "recycling sandbox slot (%d/%d): %s",
+                        "recycling sandbox slot (%d/%d) exc_type=%s endpoint=%s "
+                        "sandbox_id=%s slot_id=%s generation=%s detail=%s",
                         state.trajectory_id,
                         attempt + 1,
                         recycle_attempts,
-                        exc,
+                        type(exc).__name__,
+                        context["endpoint"],
+                        context["sandbox_id"],
+                        context["slot_id"],
+                        context["generation"],
+                        _exception_summary(exc),
                     )
                     state = await self._recycle_state_for_register(state)
 
         raise RuntimeError("unreachable register_agent recycle loop exit")
+
+    async def _register_agent_with_transport_retries(
+        self,
+        state: SandboxState,
+        *,
+        instance_id: str,
+        session_id: str,
+        router_url: str,
+        blackbox_type: str,
+        backend_options: Any,
+        server_config: dict[str, Any],
+        router_api_path: str,
+        recycle_attempt: int,
+    ) -> dict[str, Any]:
+        retries = _env_int(
+            "DRESSAGE_BLACKBOX_REGISTER_TRANSPORT_RETRIES",
+            2,
+            min_value=0,
+        )
+        delay = _env_float(
+            "DRESSAGE_BLACKBOX_REGISTER_RETRY_INITIAL_DELAY_SEC",
+            0.1,
+            min_value=0.0,
+        )
+        max_delay = _env_float(
+            "DRESSAGE_BLACKBOX_REGISTER_RETRY_MAX_DELAY_SEC",
+            0.5,
+            min_value=0.0,
+        )
+        for transport_attempt in range(retries + 1):
+            attempt_start = time.perf_counter()
+            try:
+                return await self._register_agent_once(
+                    state,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    router_url=router_url,
+                    blackbox_type=blackbox_type,
+                    backend_options=backend_options,
+                    server_config=server_config,
+                    router_api_path=router_api_path,
+                )
+            except _REGISTER_RECYCLE_ERRORS as exc:
+                if transport_attempt >= retries:
+                    raise
+                context = self._register_log_context(state)
+                logger.warning(
+                    "register_agent transport failure for trajectory_id=%s; "
+                    "retrying same sandbox slot (%d/%d) exc_type=%s endpoint=%s "
+                    "sandbox_id=%s slot_id=%s generation=%s recycle_attempt=%d "
+                    "elapsed=%.3fs detail=%s",
+                    state.trajectory_id,
+                    transport_attempt + 1,
+                    retries,
+                    type(exc).__name__,
+                    context["endpoint"],
+                    context["sandbox_id"],
+                    context["slot_id"],
+                    context["generation"],
+                    recycle_attempt,
+                    time.perf_counter() - attempt_start,
+                    _exception_summary(exc),
+                )
+                sleep_for = _jittered_delay(min(delay, max_delay), 0.2) if max_delay > 0 else 0.0
+                if sleep_for > 0:
+                    await asyncio.sleep(sleep_for)
+                if max_delay > 0:
+                    delay = min(delay * 2 if delay > 0 else max_delay, max_delay)
+        raise RuntimeError("unreachable register_agent transport retry loop exit")
 
     async def _register_agent_once(
         self,
@@ -222,6 +308,17 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             server_config=server_config,
             router_api_path=router_api_path,
         )
+
+    def _register_log_context(self, state: SandboxState) -> dict[str, Any]:
+        lease = self._leases.get(state.trajectory_id)
+        endpoint = self._endpoint_for_state(state, lease)
+        metadata = lease.metadata if lease is not None else {}
+        return {
+            "endpoint": endpoint.url,
+            "sandbox_id": state.sandbox_id,
+            "slot_id": metadata.get("slot_id"),
+            "generation": metadata.get("generation"),
+        }
 
     async def _recycle_state_for_register(self, state: SandboxState) -> SandboxState:
         spec = self._specs.get(state.trajectory_id)

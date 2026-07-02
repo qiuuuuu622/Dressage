@@ -32,7 +32,12 @@ class FakeProvider:
                 if paddock_mode == "blackbox"
                 else {"command", "file"}
             ),
-            metadata={"node_ip": "10.0.0.12", "port": 31000},
+            metadata={
+                "node_ip": "10.0.0.12",
+                "port": 31000,
+                "slot_id": lease_index - 1,
+                "generation": lease_index,
+            },
         )
         if paddock_mode == "blackbox":
             lease.endpoints["blackbox"] = SandboxEndpoint(
@@ -149,13 +154,15 @@ async def _run_blackbox_register_recycles_slot_after_retryable_failure():
     await client.aclose()
 
 
-def test_blackbox_register_recycles_slot_after_read_error(monkeypatch):
+def test_blackbox_register_retries_same_slot_after_read_error(monkeypatch):
     monkeypatch.setenv("DRESSAGE_BLACKBOX_AGENT_REQUEST_MAX_ATTEMPTS", "1")
     monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_RECYCLE_ATTEMPTS", "1")
-    asyncio.run(_run_blackbox_register_recycles_slot_after_read_error())
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_TRANSPORT_RETRIES", "1")
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_RETRY_INITIAL_DELAY_SEC", "0")
+    asyncio.run(_run_blackbox_register_retries_same_slot_after_read_error())
 
 
-async def _run_blackbox_register_recycles_slot_after_read_error():
+async def _run_blackbox_register_retries_same_slot_after_read_error():
     register_attempts = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -182,6 +189,48 @@ async def _run_blackbox_register_recycles_slot_after_read_error():
     assert await paddock.register_agent(state, instance_id="inst", session_id="traj-1") == {"ok": True}
 
     assert register_attempts == 2
+    assert len(provider.created) == 1
+    assert provider.terminated == []
+    assert paddock._states["traj-1"].sandbox_id == "lease-traj-1-1"
+
+    await client.aclose()
+
+
+def test_blackbox_register_recycles_slot_after_repeated_read_error(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_AGENT_REQUEST_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_RECYCLE_ATTEMPTS", "1")
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_TRANSPORT_RETRIES", "1")
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_REGISTER_RETRY_INITIAL_DELAY_SEC", "0")
+    asyncio.run(_run_blackbox_register_recycles_slot_after_repeated_read_error())
+
+
+async def _run_blackbox_register_recycles_slot_after_repeated_read_error():
+    register_attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal register_attempts
+        if request.url.path == "/v1/rollout/register":
+            register_attempts += 1
+            if register_attempts <= 2:
+                raise httpx.ReadError("server dropped register response", request=request)
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = FakeProvider()
+    paddock = BlackboxAgentPaddock(
+        provider=provider,
+        proxy_public_url="http://proxy.test",
+        wait_health=False,
+    )
+    from dressage.paddock.blackbox.client import BlackboxServerClient
+
+    paddock._client = BlackboxServerClient(client=client)
+
+    state = await paddock.init("traj-1")
+    assert await paddock.register_agent(state, instance_id="inst", session_id="traj-1") == {"ok": True}
+
+    assert register_attempts == 3
     assert len(provider.created) == 2
     assert len(provider.terminated) == 1
     assert provider.terminated[0].sandbox_id == "lease-traj-1-1"
