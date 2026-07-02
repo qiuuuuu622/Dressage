@@ -167,31 +167,12 @@ class OpencodeAdapter(BackendAdapter):
         )
         binary = os.getenv("OPENCODE_BIN", "opencode")
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                binary,
-                "serve",
-                "--port",
-                str(self._port),
-                "--hostname",
-                "127.0.0.1",
-                cwd=str(runtime_dir),
+            await self._start_backend_process(
+                binary=binary,
+                runtime_dir=runtime_dir,
+                run_dir=run_dir,
                 env=env,
-                stdout=self._stdout_handle,
-                stderr=self._stderr_handle,
-                start_new_session=True,
             )
-            self._process_group_id = self._process.pid
-        except FileNotFoundError as exc:
-            raise BackendProcessError(
-                f"opencode binary not found. Set OPENCODE_BIN or install opencode. ({binary})"
-            ) from exc
-
-        (run_dir / "opencode.pid").write_text(str(self._process.pid), encoding="utf-8")
-        (run_dir / "opencode.port").write_text(str(self._port), encoding="utf-8")
-        self._client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{self._port}", timeout=None)
-
-        try:
-            await self._wait_until_healthy()
         except Exception:
             await self.shutdown()
             raise
@@ -541,6 +522,94 @@ class OpencodeAdapter(BackendAdapter):
                 await asyncio.wait_for(self._proxy_task, timeout=1.0)
         self._proxy_task = None
         self._proxy_server = None
+
+    async def _start_backend_process(
+        self,
+        *,
+        binary: str,
+        runtime_dir: Path,
+        run_dir: Path,
+        env: dict[str, str],
+    ) -> None:
+        max_attempts = max(
+            1,
+            int(
+                os.getenv(
+                    "DRESSAGE_BLACKBOX_OPENCODE_PORT_BIND_ATTEMPTS",
+                    os.getenv("DRESSAGE_BLACKBOX_BACKEND_PORT_BIND_ATTEMPTS", "8"),
+                )
+            ),
+        )
+        last_exc: BackendProcessError | None = None
+        for attempt in range(1, max_attempts + 1):
+            self._port = self._find_free_port()
+            LOGGER.info(
+                "starting opencode server on port %d attempt=%d/%d",
+                self._port,
+                attempt,
+                max_attempts,
+            )
+            try:
+                self._process = await asyncio.create_subprocess_exec(
+                    binary,
+                    "serve",
+                    "--port",
+                    str(self._port),
+                    "--hostname",
+                    "127.0.0.1",
+                    cwd=str(runtime_dir),
+                    env=env,
+                    stdout=self._stdout_handle,
+                    stderr=self._stderr_handle,
+                    start_new_session=True,
+                )
+                self._process_group_id = self._process.pid
+            except FileNotFoundError as exc:
+                raise BackendProcessError(
+                    f"opencode binary not found. Set OPENCODE_BIN or install opencode. ({binary})"
+                ) from exc
+
+            (run_dir / "opencode.pid").write_text(str(self._process.pid), encoding="utf-8")
+            (run_dir / "opencode.port").write_text(str(self._port), encoding="utf-8")
+            self._client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{self._port}", timeout=None)
+            try:
+                await self._wait_until_healthy()
+            except BackendProcessError as exc:
+                last_exc = exc
+                failed_port = self._port
+                await self._stop_backend_process()
+                if attempt >= max_attempts:
+                    break
+                LOGGER.warning(
+                    "opencode server failed to start on port %s; retrying with another port (%d/%d): %s",
+                    failed_port,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+                continue
+            except Exception:
+                await self._stop_backend_process()
+                raise
+            return
+        raise last_exc or BackendProcessError("Failed to start opencode server.")
+
+    async def _stop_backend_process(self) -> None:
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.aclose()
+            self._client = None
+        if self._process is not None:
+            if self._process.returncode is None:
+                self._process.terminate()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self._process.kill()
+                    await self._process.wait()
+            self._process = None
+            self._process_group_id = None
+        self._port = None
 
     def _resolve_upstream_origin(self, router_base_url: str) -> str:
         raw = router_base_url

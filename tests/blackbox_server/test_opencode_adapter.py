@@ -614,6 +614,84 @@ def test_start_proxy_retries_when_proxy_port_bind_fails(
     assert (runtime_dir / "run" / "proxy.port").read_text(encoding="utf-8") == "2222"
 
 
+def test_start_backend_process_retries_when_opencode_health_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.returncode: int | None = None
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    runtime_dir = tmp_path / "runtime"
+    run_dir = runtime_dir / "run"
+    logs_dir = runtime_dir / "logs"
+    run_dir.mkdir(parents=True)
+    logs_dir.mkdir(parents=True)
+    adapter = OpencodeAdapter()
+    adapter._stdout_handle = open(logs_dir / "opencode.stdout.log", "ab")
+    adapter._stderr_handle = open(logs_dir / "opencode.stderr.log", "ab")
+    ports = iter([3333, 4444])
+    processes: list[FakeProcess] = []
+    spawned_ports: list[str] = []
+    wait_calls = 0
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeProcess:
+        port = str(args[args.index("--port") + 1])
+        spawned_ports.append(port)
+        process = FakeProcess(1000 + len(processes))
+        processes.append(process)
+        return process
+
+    async def wait_until_healthy() -> None:
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise BackendProcessError("opencode exited early with code 1")
+
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_OPENCODE_PORT_BIND_ATTEMPTS", "2")
+    monkeypatch.setattr(adapter, "_find_free_port", lambda: next(ports))
+    monkeypatch.setattr(adapter, "_wait_until_healthy", wait_until_healthy)
+    monkeypatch.setattr(
+        opencode_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    try:
+        asyncio.run(
+            adapter._start_backend_process(
+                binary="opencode",
+                runtime_dir=runtime_dir,
+                run_dir=run_dir,
+                env={},
+            )
+        )
+    finally:
+        adapter._stdout_handle.close()
+        adapter._stderr_handle.close()
+
+    assert spawned_ports == ["3333", "4444"]
+    assert processes[0].terminated is True
+    assert adapter._port == 4444
+    assert (run_dir / "opencode.port").read_text(encoding="utf-8") == "4444"
+
+
 def test_build_opencode_config_includes_model_limit_and_compaction():
     adapter = OpencodeAdapter()
     adapter._proxy_port = 4567
