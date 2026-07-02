@@ -65,6 +65,13 @@ class _BackgroundUvicornServer(uvicorn.Server):
         yield
 
 
+async def _serve_background_uvicorn(server: uvicorn.Server) -> None:
+    try:
+        await server.serve()
+    except (KeyboardInterrupt, SystemExit) as exc:
+        raise RuntimeError(f"background uvicorn server exited: {exc}") from exc
+
+
 class OpencodeModelLimit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -453,39 +460,66 @@ class OpencodeAdapter(BackendAdapter):
         bound_session_id = binding_context.binding.bound_session_id
         bound_instance_id = binding_context.binding.bound_instance_id
         upstream_origin = self._resolve_upstream_origin(binding_context.binding.router_base_url)
-        self._proxy_port = self._find_free_port()
-        LOGGER.info(
-            "starting rollout proxy on port %d, upstream_origin=%s, router_api_path=%s",
-            self._proxy_port,
-            upstream_origin,
-            binding_context.binding.router_api_path,
-        )
-        self._proxy = RolloutLLMProxy(
-            upstream_origin=upstream_origin,
-            router_api_path=binding_context.binding.router_api_path,
-            bound_session_id=bound_session_id,
-            bound_instance_id=bound_instance_id,
-            sticky_header_name=options.proxy.sticky_header_name,
-            max_steps=options.proxy.max_steps,
-            default_temperature=options.proxy.default_temperature,
-        )
-        config = uvicorn.Config(
-            self._proxy.app,
-            host="127.0.0.1",
-            port=self._proxy_port,
-            log_level="warning",
-        )
-        self._proxy_server = _BackgroundUvicornServer(config)
-        self._proxy_task = asyncio.create_task(self._proxy_server.serve())
-        await self._wait_for_proxy()
-        run_dir = Path(binding_context.binding.runtime_dir) / "run"
-        (run_dir / "proxy.port").write_text(str(self._proxy_port), encoding="utf-8")
-        LOGGER.info("rollout proxy started successfully on port %d", self._proxy_port)
+        max_attempts = max(1, int(os.getenv("DRESSAGE_BLACKBOX_PROXY_PORT_BIND_ATTEMPTS", "8")))
+        last_exc: BackendProcessError | None = None
+        for attempt in range(1, max_attempts + 1):
+            self._proxy_port = self._find_free_port()
+            LOGGER.info(
+                "starting rollout proxy on port %d, upstream_origin=%s, router_api_path=%s attempt=%d/%d",
+                self._proxy_port,
+                upstream_origin,
+                binding_context.binding.router_api_path,
+                attempt,
+                max_attempts,
+            )
+            self._proxy = RolloutLLMProxy(
+                upstream_origin=upstream_origin,
+                router_api_path=binding_context.binding.router_api_path,
+                bound_session_id=bound_session_id,
+                bound_instance_id=bound_instance_id,
+                sticky_header_name=options.proxy.sticky_header_name,
+                max_steps=options.proxy.max_steps,
+                default_temperature=options.proxy.default_temperature,
+            )
+            config = uvicorn.Config(
+                self._proxy.app,
+                host="127.0.0.1",
+                port=self._proxy_port,
+                log_level="warning",
+            )
+            self._proxy_server = _BackgroundUvicornServer(config)
+            self._proxy_task = asyncio.create_task(_serve_background_uvicorn(self._proxy_server))
+            try:
+                await self._wait_for_proxy()
+            except BackendProcessError as exc:
+                last_exc = exc
+                failed_port = self._proxy_port
+                await self._stop_proxy_server()
+                if attempt >= max_attempts:
+                    break
+                LOGGER.warning(
+                    "rollout proxy failed to start on port %s; retrying with another port (%d/%d): %s",
+                    failed_port,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+                continue
+            run_dir = Path(binding_context.binding.runtime_dir) / "run"
+            (run_dir / "proxy.port").write_text(str(self._proxy_port), encoding="utf-8")
+            LOGGER.info("rollout proxy started successfully on port %d", self._proxy_port)
+            return
+        raise last_exc or BackendProcessError("Failed to start rollout proxy.")
 
     async def _wait_for_proxy(self, timeout: float = 5.0) -> None:
         assert self._proxy_port is not None
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
+            if self._proxy_task is not None and self._proxy_task.done():
+                task_exc: BaseException | None = None
+                with contextlib.suppress(BaseException):
+                    task_exc = self._proxy_task.exception()
+                raise BackendProcessError(f"rollout proxy exited during startup: {task_exc!r}")
             try:
                 async with httpx.AsyncClient() as client:
                     response = await client.get(
@@ -498,6 +532,15 @@ class OpencodeAdapter(BackendAdapter):
                 pass
             await asyncio.sleep(0.1)
         raise BackendProcessError("Timed out waiting for rollout proxy startup.")
+
+    async def _stop_proxy_server(self) -> None:
+        if self._proxy_server is not None:
+            self._proxy_server.should_exit = True
+        if self._proxy_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(self._proxy_task, timeout=1.0)
+        self._proxy_task = None
+        self._proxy_server = None
 
     def _resolve_upstream_origin(self, router_base_url: str) -> str:
         raw = router_base_url

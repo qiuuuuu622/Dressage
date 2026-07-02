@@ -550,6 +550,70 @@ def test_start_proxy_passes_default_temperature_to_rollout_proxy(
     assert captured["default_temperature"] == 0.25
 
 
+def test_start_proxy_retries_when_proxy_port_bind_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeRolloutLLMProxy:
+        def __init__(self, **kwargs: Any) -> None:
+            async def app(scope, receive, send):
+                return None
+
+            self.app = app
+
+    class FakeBackgroundUvicornServer:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            return None
+
+    runtime_dir = tmp_path / "runtime"
+    (runtime_dir / "run").mkdir(parents=True)
+    adapter = OpencodeAdapter()
+    binding_context = _make_binding_context(
+        provider_id="sglang",
+        provider_name="Remote SGLang",
+        provider_package="@ai-sdk/openai-compatible",
+        model_id="qwen35-a3b",
+        model_name="Qwen 3.5 35B A3B",
+        runtime_dir=str(runtime_dir),
+    )
+    options = OpencodeBackendOptions(
+        provider_id="sglang",
+        provider_name="Remote SGLang",
+        provider_package="@ai-sdk/openai-compatible",
+        model_id="qwen35-a3b",
+        model_name="Qwen 3.5 35B A3B",
+        proxy=ProxyOptions(),
+    )
+    ports = iter([1111, 2222])
+    wait_calls = 0
+
+    async def wait_for_proxy() -> None:
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise BackendProcessError("rollout proxy exited during startup")
+
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_PROXY_PORT_BIND_ATTEMPTS", "2")
+    monkeypatch.setattr(opencode_module, "RolloutLLMProxy", FakeRolloutLLMProxy)
+    monkeypatch.setattr(
+        opencode_module,
+        "_BackgroundUvicornServer",
+        FakeBackgroundUvicornServer,
+    )
+    monkeypatch.setattr(adapter, "_find_free_port", lambda: next(ports))
+    monkeypatch.setattr(adapter, "_wait_for_proxy", wait_for_proxy)
+
+    asyncio.run(adapter._start_proxy(binding_context, options))
+
+    assert wait_calls == 2
+    assert adapter._proxy_port == 2222
+    assert (runtime_dir / "run" / "proxy.port").read_text(encoding="utf-8") == "2222"
+
+
 def test_build_opencode_config_includes_model_limit_and_compaction():
     adapter = OpencodeAdapter()
     adapter._proxy_port = 4567
