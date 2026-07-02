@@ -47,6 +47,7 @@ class NodeRecord:
     restarting: int = 0
     failed: int = 0
     lost: int = 0
+    pending_acquires: int = 0
     last_heartbeat_ts: float = 0.0
     draining: bool = False
     last_error: str | None = None
@@ -89,6 +90,7 @@ class NodeRecord:
             "restarting": self.restarting,
             "failed": self.failed,
             "lost": self.lost,
+            "pending_acquires": self.pending_acquires,
             "draining": self.draining,
             "last_heartbeat_ts": self.last_heartbeat_ts,
             "last_error": self.last_error,
@@ -247,9 +249,11 @@ class LocalBwrapClusterManagerCore:
         env_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + self.acquire_timeout_sec
+        env_args = env_args or {}
         while True:
             if self._closed:
                 raise RuntimeError("local_bwrap cluster manager is shut down")
+            node: NodeRecord | None = None
             async with self._lock:
                 if self._closed:
                     raise RuntimeError("local_bwrap cluster manager is shut down")
@@ -267,34 +271,86 @@ class LocalBwrapClusterManagerCore:
                         self._drop_lease_locked(existing)
                     await self._refresh_nodes_if_needed_locked(force=False)
                     node = self._select_node_locked()
-                if node is not None:
-                    try:
-                        payload = await _remote_call(
-                            node.supervisor,
-                            "acquire",
-                            trajectory_id=trajectory_id,
-                            env_type=env_type,
-                            env_args=env_args or {},
+                    if node is not None:
+                        node.pending_acquires += 1
+
+            if node is not None:
+                try:
+                    payload = await _remote_call(
+                        node.supervisor,
+                        "acquire",
+                        trajectory_id=trajectory_id,
+                        env_type=env_type,
+                        env_args=env_args,
+                    )
+                except asyncio.CancelledError:
+                    async with self._lock:
+                        current = self.nodes.get(node.node_id)
+                        if current is not None:
+                            current.pending_acquires = max(
+                                0, current.pending_acquires - 1
+                            )
+                    raise
+                except Exception as exc:
+                    async with self._lock:
+                        current = self.nodes.get(node.node_id)
+                        if current is not None:
+                            current.pending_acquires = max(
+                                0, current.pending_acquires - 1
+                            )
+                            current.mark_lost(exc)
+                    logger.warning(
+                        "local_bwrap supervisor acquire failed on node_id=%s: %s",
+                        node.node_id,
+                        _exception_summary(exc),
+                    )
+                else:
+                    lease = LeaseRecord.from_payload(
+                        payload,
+                        lease_ttl_sec=self.lease_ttl_sec,
+                    )
+                    cleanup_acquired_slot = False
+                    return_existing: dict[str, Any] | None = None
+                    manager_closed = False
+                    async with self._lock:
+                        current = self.nodes.get(node.node_id)
+                        if current is not None:
+                            current.pending_acquires = max(
+                                0, current.pending_acquires - 1
+                            )
+                        if self._closed:
+                            cleanup_acquired_slot = True
+                            manager_closed = True
+                        elif current is None or not current.alive:
+                            cleanup_acquired_slot = True
+                        else:
+                            existing = self.leases.get(trajectory_id)
+                            if existing is not None and existing.status == LEASE_ACTIVE:
+                                cleanup_acquired_slot = True
+                                return_existing = existing.to_dict()
+                            elif existing is not None and existing.status == LEASE_RELEASING:
+                                cleanup_acquired_slot = True
+                            else:
+                                if existing is not None:
+                                    self._drop_lease_locked(existing)
+                                self.leases[trajectory_id] = lease
+                                self._leases_by_id[lease.lease_id] = trajectory_id
+                                current.used += 1
+                                current.leased += 1
+                                current.free = max(0, current.free - 1)
+                                current.ready = max(0, current.ready - 1)
+                                return lease.to_dict()
+
+                    if cleanup_acquired_slot:
+                        await self._release_uncommitted_acquire(
+                            node=node,
+                            payload=payload,
+                            reason="manager_acquire_not_committed",
                         )
-                    except Exception as exc:
-                        node.mark_lost(exc)
-                        logger.warning(
-                            "local_bwrap supervisor acquire failed on node_id=%s: %s",
-                            node.node_id,
-                            _exception_summary(exc),
-                        )
-                    else:
-                        lease = LeaseRecord.from_payload(
-                            payload,
-                            lease_ttl_sec=self.lease_ttl_sec,
-                        )
-                        self.leases[trajectory_id] = lease
-                        self._leases_by_id[lease.lease_id] = trajectory_id
-                        node.used += 1
-                        node.leased += 1
-                        node.free = max(0, node.free - 1)
-                        node.ready = max(0, node.ready - 1)
-                        return lease.to_dict()
+                    if return_existing is not None:
+                        return return_existing
+                    if manager_closed:
+                        raise RuntimeError("local_bwrap cluster manager is shut down")
 
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"no local_bwrap {self.pool_mode} slot available")
@@ -599,6 +655,28 @@ class LocalBwrapClusterManagerCore:
                     _exception_summary(exc),
                 )
 
+    async def _release_uncommitted_acquire(
+        self,
+        *,
+        node: NodeRecord,
+        payload: dict[str, Any],
+        reason: str,
+    ) -> None:
+        try:
+            await _remote_call(
+                node.supervisor,
+                "release",
+                lease_id=payload.get("lease_id"),
+                trajectory_id=payload.get("trajectory_id"),
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort leak prevention
+            logger.warning(
+                "local_bwrap cleanup for uncommitted acquire failed on node_id=%s: %s",
+                node.node_id,
+                _exception_summary(exc),
+            )
+
     async def _release_lease_in_background(
         self,
         *,
@@ -784,15 +862,17 @@ class LocalBwrapClusterManagerCore:
         candidates = [
             node
             for node in self.nodes.values()
-            if node.alive and not node.draining and node.free > 0
+            if node.alive
+            and not node.draining
+            and node.free - node.pending_acquires > 0
         ]
         if not candidates:
             return None
         return min(
             candidates,
             key=lambda node: (
-                node.used / max(node.capacity, 1),
-                -node.free,
+                (node.used + node.pending_acquires) / max(node.capacity, 1),
+                -(node.free - node.pending_acquires),
                 node.node_id,
             ),
         )

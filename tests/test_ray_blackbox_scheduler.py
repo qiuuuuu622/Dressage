@@ -182,6 +182,79 @@ async def _run_cluster_manager_acquire_and_release_are_idempotent():
     assert released_after_completion["already_released"] is True
 
 
+def test_cluster_manager_release_is_not_blocked_by_inflight_supervisor_acquire():
+    asyncio.run(_run_cluster_manager_release_is_not_blocked_by_inflight_supervisor_acquire())
+
+
+async def _run_cluster_manager_release_is_not_blocked_by_inflight_supervisor_acquire():
+    manager = LocalBwrapClusterManagerCore(
+        acquire_timeout_sec=0.2,
+        acquire_poll_interval_sec=0.001,
+        status_refresh_interval_sec=999,
+    )
+    supervisor = BlockingAcquireSupervisor(
+        node_id="node-a",
+        node_ip="10.0.0.10",
+        capacity=2,
+        ready=2,
+        blocked_trajectory="traj-slow",
+    )
+    await manager.add_supervisor(
+        node_id="node-a",
+        node_ip=supervisor.node_ip,
+        capacity=supervisor.capacity,
+        supervisor=supervisor,
+    )
+
+    held = await manager.acquire("traj-held")
+    slow_acquire = asyncio.create_task(manager.acquire("traj-slow"))
+    await asyncio.wait_for(supervisor.acquire_started.wait(), timeout=0.05)
+
+    released = await asyncio.wait_for(
+        manager.release("traj-held", held["lease_id"]), timeout=0.05
+    )
+
+    supervisor.acquire_can_finish.set()
+    slow = await asyncio.wait_for(slow_acquire, timeout=0.1)
+    assert released["release_queued"] is True
+    assert slow["trajectory_id"] == "traj-slow"
+
+
+def test_cluster_manager_cancelled_acquire_releases_pending_reservation():
+    asyncio.run(_run_cluster_manager_cancelled_acquire_releases_pending_reservation())
+
+
+async def _run_cluster_manager_cancelled_acquire_releases_pending_reservation():
+    manager = LocalBwrapClusterManagerCore(
+        acquire_timeout_sec=0.2,
+        acquire_poll_interval_sec=0.001,
+        status_refresh_interval_sec=999,
+    )
+    supervisor = BlockingAcquireSupervisor(
+        node_id="node-a",
+        node_ip="10.0.0.10",
+        capacity=1,
+        ready=1,
+        blocked_trajectory="traj-slow",
+    )
+    await manager.add_supervisor(
+        node_id="node-a",
+        node_ip=supervisor.node_ip,
+        capacity=supervisor.capacity,
+        supervisor=supervisor,
+    )
+
+    acquire_task = asyncio.create_task(manager.acquire("traj-slow"))
+    await asyncio.wait_for(supervisor.acquire_started.wait(), timeout=0.05)
+    acquire_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire_task
+
+    status = await manager.status(force_refresh=False)
+    assert status["nodes"][0]["pending_acquires"] == 0
+    assert status["total_ready"] == 1
+
+
 def test_cluster_manager_does_not_allocate_draining_node():
     asyncio.run(_run_cluster_manager_does_not_allocate_draining_node())
 
@@ -243,6 +316,37 @@ async def _run_cluster_manager_expires_leases():
 
     assert status["leases"]["active"] == 0
     assert supervisor.force_release_calls == [(lease["slot_id"], lease["lease_id"])]
+
+
+class BlockingAcquireSupervisor(FakeSupervisor):
+    def __init__(self, *, blocked_trajectory: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.blocked_trajectory = blocked_trajectory
+        self.acquire_started = asyncio.Event()
+        self.acquire_can_finish = asyncio.Event()
+
+    async def acquire(self, trajectory_id: str, env_type=None, env_args=None) -> dict:
+        del env_type, env_args
+        self.acquire_calls.append(trajectory_id)
+        if trajectory_id == self.blocked_trajectory:
+            self.acquire_started.set()
+            await self.acquire_can_finish.wait()
+        if self.ready <= 0:
+            raise TimeoutError("no slot")
+        slot_id = self.leased
+        self.ready -= 1
+        self.leased += 1
+        return {
+            "lease_id": f"lease-{self.node_id}-{slot_id}-{trajectory_id}",
+            "trajectory_id": trajectory_id,
+            "node_id": self.node_id,
+            "node_ip": self.node_ip,
+            "slot_id": slot_id,
+            "port": 31000 + slot_id,
+            "sandbox_url": f"http://{self.node_ip}:{31000 + slot_id}",
+            "generation": 1,
+            "ready": True,
+        }
 
 
 class SlowReleaseSupervisor(FakeSupervisor):

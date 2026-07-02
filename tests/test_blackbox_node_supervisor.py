@@ -70,6 +70,31 @@ class BlockingStopRunner(FakeRunner):
             await slot.process.wait()
 
 
+class CountingBlockingStopRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_stops = 0
+        self.max_active_stops = 0
+        self.stop_started_count = 0
+        self.stop_started = asyncio.Event()
+        self.stop_can_finish = asyncio.Event()
+
+    async def stop(self, slot, timeout_sec=None):
+        del timeout_sec
+        self.stops += 1
+        self.stop_started_count += 1
+        self.active_stops += 1
+        self.max_active_stops = max(self.max_active_stops, self.active_stops)
+        self.stop_started.set()
+        try:
+            await self.stop_can_finish.wait()
+            if slot.process is not None:
+                slot.process.terminate()
+                await slot.process.wait()
+        finally:
+            self.active_stops -= 1
+
+
 def test_node_supervisor_starts_leases_and_releases_slots(tmp_path):
     asyncio.run(_run_node_supervisor_starts_leases_and_releases_slots(tmp_path))
 
@@ -184,6 +209,56 @@ async def _run_node_supervisor_hard_reset_restarts_process(tmp_path):
     assert runner.stops >= 1
     assert status["ready"] == 1
     assert status["leased"] == 0
+
+
+def test_node_supervisor_limits_concurrent_resets(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRESSAGE_LOCAL_BWRAP_RESET_CONCURRENCY", "1")
+    asyncio.run(_run_node_supervisor_limits_concurrent_resets(tmp_path))
+
+
+async def _run_node_supervisor_limits_concurrent_resets(tmp_path):
+    runner = CountingBlockingStopRunner()
+    supervisor = LocalBwrapNodeSupervisorCore(
+        node_id="node-a",
+        node_ip="10.0.0.12",
+        capacity=2,
+        base_port=31000,
+        base_dir=tmp_path,
+        runner=runner,
+        health_checker=lambda url: True,
+        reset_strategy="hard",
+        start_health_loop=False,
+    )
+
+    await supervisor.start_pool()
+    first = await supervisor.acquire("traj-1")
+    second = await supervisor.acquire("traj-2")
+    await supervisor.release(
+        lease_id=first["lease_id"],
+        trajectory_id="traj-1",
+        reason="test",
+    )
+    await supervisor.release(
+        lease_id=second["lease_id"],
+        trajectory_id="traj-2",
+        reason="test",
+    )
+    await asyncio.wait_for(runner.stop_started.wait(), timeout=0.1)
+    await asyncio.sleep(0.02)
+
+    assert runner.stop_started_count == 1
+    assert runner.max_active_stops == 1
+
+    runner.stop_can_finish.set()
+    for _ in range(20):
+        status = await supervisor.health()
+        if status["ready"] == 2 and runner.stops == 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("limited resets did not complete")
+    assert status["reset_concurrency"] == 1
+    await supervisor.shutdown()
 
 
 def test_node_supervisor_reports_logs_when_process_exits(tmp_path):

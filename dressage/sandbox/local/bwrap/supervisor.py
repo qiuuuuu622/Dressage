@@ -163,6 +163,13 @@ class LocalBwrapNodeSupervisorCore:
             86400.0,
             min_value=0.0,
         )
+        default_reset_concurrency = max(1, min(capacity or 1, 64))
+        self.reset_concurrency = _env_int(
+            "DRESSAGE_LOCAL_BWRAP_RESET_CONCURRENCY",
+            default_reset_concurrency,
+            min_value=1,
+        )
+        self._reset_semaphore = asyncio.Semaphore(self.reset_concurrency)
         self._slots: list[SlotRuntime] = [
             SlotRuntime(
                 SlotConfig(
@@ -309,7 +316,7 @@ class LocalBwrapNodeSupervisorCore:
             slot.acquired_ts = None
 
         self._schedule_task(
-            self._reset_slot(
+            self._reset_slot_limited(
                 slot,
                 reason or "release",
                 expected_generation=payload["generation"],
@@ -383,6 +390,7 @@ class LocalBwrapNodeSupervisorCore:
             "lost": counts.get(SLOT_LOST, 0),
             "empty": counts.get(SLOT_EMPTY, 0),
             "background_tasks": len(self._background_tasks),
+            "reset_concurrency": self.reset_concurrency,
             "slots": [slot.to_dict() for slot in self._slots],
             "last_error": self._last_error(),
         }
@@ -605,6 +613,24 @@ class LocalBwrapNodeSupervisorCore:
                 "failed to start local_bwrap blackbox slot node_id=%s slot_id=%s",
                 self.node_id,
                 slot.config.slot_id,
+            )
+
+    async def _reset_slot_limited(
+        self,
+        slot: SlotRuntime,
+        reason: str,
+        *,
+        expected_generation: int | None = None,
+        session_id: str | None = None,
+        lease_id: str | None = None,
+    ) -> None:
+        async with self._reset_semaphore:
+            await self._reset_slot(
+                slot,
+                reason,
+                expected_generation=expected_generation,
+                session_id=session_id,
+                lease_id=lease_id,
             )
 
     async def _reset_slot(
