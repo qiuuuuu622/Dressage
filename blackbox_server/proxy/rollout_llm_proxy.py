@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,6 +32,13 @@ class _TurnScope:
     context_overflow_error: dict[str, Any] | None = None
     rollout_invalidated_error: dict[str, Any] | None = None
     max_steps_error: dict[str, Any] | None = None
+    llm_request_count: int = 0
+    llm_plain_http_s: float = 0.0
+    llm_stream_http_s: float = 0.0
+    llm_request_bytes: int = 0
+    llm_response_bytes: int = 0
+    llm_error_count: int = 0
+    step_records: list[dict[str, Any]] = field(default_factory=list)
     drained: asyncio.Event = field(default_factory=asyncio.Event)
     max_steps_exceeded: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -46,6 +54,51 @@ class _TurnSnapshot:
     step: int
     scope: _TurnScope | None = None
     max_steps_exceeded: bool = False
+
+
+@dataclass
+class _LLMRequestContext:
+    proxy: "RolloutLLMProxy"
+    snapshot: _TurnSnapshot | None
+    request_bytes: int
+    streaming: bool
+    request_profile: dict[str, Any] | None = None
+    status_code: int | None = None
+    response_bytes: int = 0
+    response_profile: dict[str, Any] = field(default_factory=dict)
+    is_error: bool = False
+    _started_at: float = 0.0
+    _closed: bool = False
+
+    async def __aenter__(self) -> "_LLMRequestContext":
+        self._started_at = time.perf_counter()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        await self.close(is_error=exc_type is not None)
+        return False
+
+    async def close(self, *, is_error: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        scope = self.snapshot.scope if self.snapshot is not None else None
+        if scope is None:
+            return
+        if self.is_error or is_error:
+            await self.proxy._record_llm_error(scope)
+        await self.proxy._record_llm_request(
+            scope,
+            step=self.snapshot.step if self.snapshot is not None else None,
+            seconds=time.perf_counter() - self._started_at,
+            request_bytes=self.request_bytes,
+            response_bytes=self.response_bytes,
+            status_code=self.status_code,
+            streaming=self.streaming,
+            request_profile=self.request_profile,
+            response_profile=self.response_profile,
+        )
+        await self.proxy._mark_request_finished(scope)
 
 
 class RolloutLLMProxy:
@@ -183,6 +236,46 @@ class RolloutLLMProxy:
     async def clear_turn(self) -> None:
         async with self._scope_lock:
             self._turn_scope = None
+
+    async def turn_profile(self) -> dict[str, Any]:
+        async with self._scope_lock:
+            scope = self._turn_scope
+            if scope is None:
+                return {}
+            records = [dict(record) for record in scope.step_records]
+
+            profile: dict[str, Any] = {
+                "proxy.llm_request_count": float(scope.llm_request_count),
+                "proxy.llm_plain_http_s": float(scope.llm_plain_http_s),
+                "proxy.llm_stream_http_s": float(scope.llm_stream_http_s),
+                "proxy.llm_http_s": float(scope.llm_plain_http_s + scope.llm_stream_http_s),
+                "proxy.llm_request_bytes": float(scope.llm_request_bytes),
+                "proxy.llm_response_bytes": float(scope.llm_response_bytes),
+                "proxy.llm_error_count": float(scope.llm_error_count),
+            }
+            durations = [
+                float(record["http_s"])
+                for record in records
+                if isinstance(record.get("http_s"), (int, float))
+            ]
+            if durations:
+                durations_sorted = sorted(durations)
+                profile.update(
+                    {
+                        "proxy.llm_step_mean_s": sum(durations) / len(durations),
+                        "proxy.llm_step_p50_s": _percentile(durations_sorted, 0.50),
+                        "proxy.llm_step_p95_s": _percentile(durations_sorted, 0.95),
+                        "proxy.llm_step_max_s": durations_sorted[-1],
+                    }
+                )
+            profile.update(_sum_step_fields(records))
+            if records:
+                profile["proxy.step_timeline_json"] = json.dumps(
+                    records[:128],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            return profile
 
     async def consume_context_overflow_error(self) -> dict[str, Any] | None:
         async with self._scope_lock:
@@ -471,6 +564,11 @@ class RolloutLLMProxy:
                 headers.get(self.sticky_header_name),
             )
 
+        request_profile = (
+            _chat_request_profile(body_json)
+            if is_chat and isinstance(body_json, dict)
+            else {}
+        )
         if is_chat and is_streaming:
             LOGGER.info("[PROXY REQUEST] Using streaming proxy")
             return await self._stream_proxy(
@@ -478,6 +576,7 @@ class RolloutLLMProxy:
                 body_bytes,
                 headers,
                 snapshot,
+                request_profile=request_profile,
             )
         LOGGER.info("[PROXY REQUEST] Using plain proxy")
         return await self._plain_proxy(
@@ -486,6 +585,7 @@ class RolloutLLMProxy:
             body_bytes,
             headers,
             snapshot,
+            request_profile=request_profile,
         )
 
     def _join_upstream(self, path: str, query: str | None = None) -> str:
@@ -644,6 +744,62 @@ class RolloutLLMProxy:
             if scope.inflight_requests == 0:
                 scope.drained.set()
 
+    async def _record_llm_request(
+        self,
+        scope: _TurnScope,
+        *,
+        step: int | None = None,
+        seconds: float,
+        request_bytes: int,
+        response_bytes: int = 0,
+        status_code: int | None = None,
+        streaming: bool,
+        request_profile: dict[str, Any] | None = None,
+        response_profile: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._scope_lock:
+            scope.llm_request_count += 1
+            scope.llm_request_bytes += max(0, int(request_bytes))
+            scope.llm_response_bytes += max(0, int(response_bytes))
+            if streaming:
+                scope.llm_stream_http_s += max(0.0, float(seconds))
+            else:
+                scope.llm_plain_http_s += max(0.0, float(seconds))
+            if step is not None:
+                record: dict[str, Any] = {
+                    "step": int(step),
+                    "http_s": max(0.0, float(seconds)),
+                    "stream": bool(streaming),
+                    "status_code": None if status_code is None else int(status_code),
+                    "request_bytes": max(0, int(request_bytes)),
+                    "response_bytes": max(0, int(response_bytes)),
+                }
+                for source in (request_profile or {}, response_profile or {}):
+                    for key, value in source.items():
+                        if isinstance(value, (int, float, str, bool)) or value is None:
+                            record[key] = value
+                scope.step_records.append(record)
+
+    async def _record_llm_error(self, scope: _TurnScope) -> None:
+        async with self._scope_lock:
+            scope.llm_error_count += 1
+
+    def _profile_llm_request(
+        self,
+        snapshot: _TurnSnapshot | None,
+        *,
+        request_bytes: int,
+        streaming: bool,
+        request_profile: dict[str, Any] | None = None,
+    ) -> _LLMRequestContext:
+        return _LLMRequestContext(
+            proxy=self,
+            snapshot=snapshot,
+            request_bytes=request_bytes,
+            streaming=streaming,
+            request_profile=request_profile,
+        )
+
     async def _plain_proxy(
         self,
         method: str,
@@ -651,11 +807,22 @@ class RolloutLLMProxy:
         body: bytes,
         headers: dict[str, str],
         snapshot: _TurnSnapshot | None,
+        *,
+        request_profile: dict[str, Any] | None = None,
     ) -> Response:
         assert self._client is not None
-        try:
+        async with self._profile_llm_request(
+            snapshot,
+            request_bytes=len(body),
+            streaming=False,
+            request_profile=request_profile,
+        ) as profile:
             response = await self._send_plain_request(method, url, body, headers)
+            profile.status_code = response.status_code
+            profile.response_bytes = len(response.content)
+            profile.response_profile = _chat_response_profile(response.content)
             if response.status_code >= 400:
+                profile.is_error = True
                 self._log_upstream_error(
                     url=url,
                     status_code=response.status_code,
@@ -674,7 +841,11 @@ class RolloutLLMProxy:
                         status_code=response.status_code,
                         response_body=response.content,
                     ):
-                        return self._synthetic_chat_completion_response()
+                        synthetic = self._synthetic_chat_completion_response()
+                        profile.status_code = synthetic.status_code
+                        profile.response_bytes = len(synthetic.body or b"")
+                        profile.response_profile = _chat_response_profile(synthetic.body or b"")
+                        return synthetic
             response_headers = dict(response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
@@ -684,9 +855,6 @@ class RolloutLLMProxy:
                 status_code=response.status_code,
                 headers=response_headers,
             )
-        finally:
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
 
     async def _stream_proxy(
         self,
@@ -694,17 +862,29 @@ class RolloutLLMProxy:
         body: bytes,
         headers: dict[str, str],
         snapshot: _TurnSnapshot | None,
+        *,
+        request_profile: dict[str, Any] | None = None,
     ) -> Response:
         assert self._client is not None
+        profile = self._profile_llm_request(
+            snapshot,
+            request_bytes=len(body),
+            streaming=True,
+            request_profile=request_profile,
+        )
+        await profile.__aenter__()
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+        except Exception as exc:
+            await profile.__aexit__(type(exc), exc, exc.__traceback__)
             raise
 
         if upstream_response.status_code >= 400:
+            profile.is_error = True
+            profile.status_code = upstream_response.status_code
             error_body = await upstream_response.aread()
+            profile.response_bytes = len(error_body)
+            profile.response_profile = _chat_response_profile(error_body)
             response_headers = dict(upstream_response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
@@ -728,25 +908,41 @@ class RolloutLLMProxy:
                     response_body=error_body,
                 ):
                     await upstream_response.aclose()
-                    await self._mark_request_finished(snapshot.scope)
-                    return self._synthetic_chat_completion_stream_response()
+                    synthetic = self._synthetic_chat_completion_stream_response()
+                    profile.status_code = synthetic.status_code
+                    profile.response_bytes = 0
+                    profile.response_profile = {}
+                    await profile.close()
+                    return synthetic
             await upstream_response.aclose()
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+            await profile.close()
             return Response(
                 content=error_body,
                 status_code=upstream_response.status_code,
                 headers=response_headers,
             )
 
+        response_bytes = 0
+        stream_buffer = ""
+        stream_response_profile: dict[str, Any] = {}
+
         async def _forward():
+            nonlocal response_bytes, stream_buffer, stream_response_profile
             try:
                 async for chunk in upstream_response.aiter_bytes():
+                    response_bytes += len(chunk)
+                    stream_buffer, parsed_profile = _consume_sse_profile(
+                        stream_buffer,
+                        chunk,
+                    )
+                    stream_response_profile.update(parsed_profile)
                     yield chunk
             finally:
                 await upstream_response.aclose()
-                if snapshot is not None and snapshot.scope is not None:
-                    await self._mark_request_finished(snapshot.scope)
+                profile.status_code = upstream_response.status_code
+                profile.response_bytes = response_bytes
+                profile.response_profile = stream_response_profile
+                await profile.close()
 
         response_headers = dict(upstream_response.headers)
         response_headers.pop("content-encoding", None)
@@ -935,3 +1131,161 @@ class RolloutLLMProxy:
         if len(text) <= limit:
             return text
         return text[:limit] + "...(truncated)"
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    index = min(
+        len(sorted_values) - 1,
+        max(0, int(round((len(sorted_values) - 1) * q))),
+    )
+    return sorted_values[index]
+
+
+def _sum_step_fields(records: list[dict[str, Any]]) -> dict[str, float]:
+    sums: dict[str, float] = {
+        "proxy.llm_prompt_tokens": 0.0,
+        "proxy.llm_completion_tokens": 0.0,
+        "proxy.llm_total_tokens": 0.0,
+        "proxy.llm_tool_call_count": 0.0,
+        "proxy.llm_tool_call_steps": 0.0,
+        "proxy.llm_length_finish_count": 0.0,
+    }
+    for record in records:
+        sums["proxy.llm_prompt_tokens"] += _float_field(record, "prompt_tokens")
+        sums["proxy.llm_completion_tokens"] += _float_field(record, "completion_tokens")
+        sums["proxy.llm_total_tokens"] += _float_field(record, "total_tokens")
+        tool_calls = _float_field(record, "tool_call_count")
+        sums["proxy.llm_tool_call_count"] += tool_calls
+        if tool_calls > 0:
+            sums["proxy.llm_tool_call_steps"] += 1.0
+        if str(record.get("finish_reason") or "").lower() == "length":
+            sums["proxy.llm_length_finish_count"] += 1.0
+        for key, value in record.items():
+            if not key.startswith(("chat_", "sglang_")):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            sums[f"proxy.llm_{key}"] = sums.get(f"proxy.llm_{key}", 0.0) + float(value)
+    return sums
+
+
+def _float_field(record: dict[str, Any], key: str) -> float:
+    value = record.get(key)
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def _chat_request_profile(body_json: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(body_json, dict):
+        return {}
+    messages = body_json.get("messages")
+    tools = body_json.get("tools")
+    profile: dict[str, Any] = {
+        "model": str(body_json.get("model") or ""),
+        "request_message_count": float(len(messages) if isinstance(messages, list) else 0),
+        "request_tool_schema_count": float(len(tools) if isinstance(tools, list) else 0),
+        "request_stream": bool(body_json.get("stream", False)),
+    }
+    sampling = body_json.get("sampling_params")
+    for source in (body_json, sampling if isinstance(sampling, dict) else {}):
+        for source_key, target_key in (
+            ("max_tokens", "request_max_tokens"),
+            ("max_new_tokens", "request_max_tokens"),
+            ("temperature", "request_temperature"),
+            ("top_p", "request_top_p"),
+        ):
+            value = source.get(source_key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                profile[target_key] = float(value)
+    return profile
+
+
+def _chat_response_profile(content: bytes) -> dict[str, Any]:
+    if not content:
+        return {}
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    profile: dict[str, Any] = {}
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        profile.update(_chat_usage_profile(usage))
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0]
+        if isinstance(first_choice, dict):
+            finish_reason = first_choice.get("finish_reason")
+            if finish_reason is not None:
+                profile["finish_reason"] = str(finish_reason)
+            message = first_choice.get("message")
+            if isinstance(message, dict):
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    profile["tool_call_count"] = float(len(tool_calls))
+                content_value = message.get("content")
+                if isinstance(content_value, str):
+                    profile["content_chars"] = float(len(content_value))
+    return profile
+
+
+def _chat_usage_profile(usage: dict[str, Any]) -> dict[str, Any]:
+    profile: dict[str, Any] = {}
+    if isinstance(usage, dict):
+        for source_key, target_key in (
+            ("prompt_tokens", "prompt_tokens"),
+            ("completion_tokens", "completion_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(source_key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                profile[target_key] = float(value)
+        nested_profile = usage.get("profile")
+        if isinstance(nested_profile, dict):
+            for key, value in nested_profile.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    profile[str(key).replace(".", "_")] = float(value)
+    return profile
+
+
+def _consume_sse_profile(buffer: str, chunk: bytes) -> tuple[str, dict[str, Any]]:
+    try:
+        buffer += chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        buffer += chunk.decode("utf-8", errors="ignore")
+    response_profile: dict[str, Any] = {}
+    while "\n\n" in buffer:
+        event, buffer = buffer.split("\n\n", 1)
+        for line in event.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                response_profile.update(_chat_usage_profile(usage))
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    finish_reason = first_choice.get("finish_reason")
+                    if finish_reason is not None:
+                        response_profile["finish_reason"] = str(finish_reason)
+    return buffer, response_profile
