@@ -29,6 +29,7 @@ SLIME_ROOT="${SLIME_ROOT:-${REPO_ROOT}/slime}"
 bash "${REPO_ROOT}/patches/apply_cudagraph_patch.sh" || true
 bash "${REPO_ROOT}/patches/apply_deepgemm_patch.sh" || true
 bash "${REPO_ROOT}/patches/apply_slime_mtp_patch.sh" || true
+bash "${REPO_ROOT}/patches/apply_sglang_gdn_mtp_verify_state_fix.sh" || true
 BASE_FOLDER="${BASE_FOLDER:-/root/model_dist}"
 
 if [[ ! -f "${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh" ]]; then
