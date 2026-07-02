@@ -171,13 +171,17 @@ class LocalBwrapSandboxProvider:
         sandbox_id = None if isinstance(lease, str) else lease.sandbox_id
         known = self._leases.pop(trajectory_id, None)
         lease_id = sandbox_id or (known.sandbox_id if known is not None else None)
-        return await _remote_call(
+        start = time.perf_counter() if profiling_enabled() else 0.0
+        result = await _remote_call(
             self._manager,
             "release",
             trajectory_id=trajectory_id,
             lease_id=lease_id,
             reason="paddock_terminate",
         )
+        if profiling_enabled() and isinstance(result, dict):
+            result["profile.provider.terminate"] = time.perf_counter() - start
+        return result
 
     async def get_public_url(
         self,

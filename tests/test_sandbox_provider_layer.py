@@ -49,6 +49,29 @@ class FakeLocalManager:
         return {"path": kwargs["path"], "bytes": len(kwargs["content"])}
 
 
+def test_local_bwrap_provider_terminate_includes_profile(monkeypatch):
+    asyncio.run(_run_local_bwrap_provider_terminate_includes_profile(monkeypatch))
+
+
+async def _run_local_bwrap_provider_terminate_includes_profile(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_PROFILE", "1")
+    monkeypatch.setenv("DRESSAGE_LOCAL_BWRAP_ACQUIRE_HEALTH_PRECHECK", "0")
+    manager = FakeLocalManager()
+    provider = LocalBwrapSandboxProvider(manager=manager)
+    lease = await provider.create(
+        SandboxSpec(
+            trajectory_id="traj-profile",
+            services=(SandboxServiceSpec(name="blackbox", port=31000),),
+            metadata={"paddock_mode": "blackbox"},
+        )
+    )
+
+    result = await provider.terminate(lease)
+
+    assert result["released"] is True
+    assert result["profile.provider.terminate"] >= 0
+
+
 class FakeE2BCommandResult:
     def __init__(
         self,

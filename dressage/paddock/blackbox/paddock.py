@@ -414,8 +414,24 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         try:
             if lease is None:
                 assert state is not None
-                return await self._provider.terminate(state.trajectory_id)
-            return await self._provider.terminate(lease)
+                result = await self._provider.terminate(state.trajectory_id)
+            else:
+                result = await self._provider.terminate(lease)
+            if isinstance(result, dict):
+                profile = {
+                    key: value
+                    for key, value in result.items()
+                    if key.startswith("profile.")
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                }
+                if profile:
+                    logger.debug(
+                        "blackbox terminate profile session_id=%s profile=%s",
+                        traj_id,
+                        profile,
+                    )
+            return result
         finally:
             provider_seconds = time.perf_counter() - provider_start
             total_seconds = time.perf_counter() - terminate_start
