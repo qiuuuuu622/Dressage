@@ -20,12 +20,12 @@ def _load_slime_sample():
 
 
 def _status(sample: Any, name: str):
-    sample_cls = _load_slime_sample()
-    if sample_cls is not None:
-        return getattr(sample_cls.Status, name)
     status_cls = getattr(sample, "Status", None)
     if status_cls is not None:
         return getattr(status_cls, name)
+    sample_cls = _load_slime_sample()
+    if sample_cls is not None:
+        return getattr(sample_cls.Status, name)
     return name.lower()
 
 
