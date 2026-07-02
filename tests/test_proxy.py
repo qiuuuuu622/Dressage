@@ -2321,6 +2321,33 @@ def test_proxy_reasoning_parser_hybrid_falls_back_to_local_qwen3():
     assert parsed.text == "local answer"
 
 
+def test_proxy_reasoning_parser_hybrid_qwen3_uses_local_first():
+    sglang_client = FakeSGLangClient(
+        [],
+        separate_reasoning_responses=[
+            {"reasoning_text": "api plan", "text": "api answer"}
+        ],
+    )
+    parser = ProxyReasoningParser(
+        sglang_client,
+        model_reasoning_type="qwen3",
+        backend="hybrid",
+    )
+    profile: dict[str, Any] = {}
+
+    parsed = asyncio.run(
+        parser.parse(
+            "<think>local plan</think>\n\nlocal answer",
+            routing_key="sess-local-first",
+            profile=profile,
+        )
+    )
+
+    assert parsed.reasoning_content == "local plan"
+    assert parsed.text == "local answer"
+    assert sglang_client.separate_reasoning_calls == []
+
+
 def test_proxy_reasoning_parser_local_rejects_unsupported_parser():
     parser = ProxyReasoningParser(
         FakeSGLangClient([]),
@@ -2485,6 +2512,42 @@ def test_proxy_tool_call_parser_hybrid_falls_back_to_local_on_api_failures():
         assert content == "Thinking Process: hybrid fallback"
         assert tool_calls is not None
         assert tool_calls[0]["function"]["name"] == "get_weather_snapshot"
+
+
+def test_proxy_tool_call_parser_hybrid_qwen_uses_local_first_when_parseable():
+    raw_text = make_qwen_tool_call_text(
+        prefix="Thinking Process: local first",
+        functions=[("get_weather_snapshot", {"city": "Shanghai"})],
+    )
+    sglang_client = FakeSGLangClient(
+        [],
+        parse_function_call_responses=[
+            {
+                "normal_text": "api text",
+                "calls": [{"name": "api_tool", "parameters": {}}],
+            }
+        ],
+    )
+    parser = ProxyToolCallParser(
+        sglang_client,
+        model_tool_call_type="qwen3_5",
+        backend="hybrid",
+    )
+    profile: dict[str, Any] = {}
+
+    content, tool_calls = asyncio.run(
+        parser.parse(
+            raw_text,
+            make_tools("get_weather_snapshot"),
+            routing_key="sess-local-first",
+            profile=profile,
+        )
+    )
+
+    assert content == "Thinking Process: local first"
+    assert tool_calls is not None
+    assert tool_calls[0]["function"]["name"] == "get_weather_snapshot"
+    assert sglang_client.parse_function_call_calls == []
 
 
 def test_proxy_tool_call_parser_unregistered_type_falls_back_to_raw_text():
@@ -2698,7 +2761,7 @@ def test_qwen_hybrid_chat_completion_preserves_content_and_tool_calls_without_fa
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["content"] == "Thinking Process: use weather tool"
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather_snapshot"
-    assert sglang_client.parse_function_call_calls[0]["tool_call_parser"] == "qwen3_coder"
+    assert sglang_client.parse_function_call_calls == []
 
     assistant_message = session_manager.get_session("sess-qwen").full_messages[-1]
     second = client.post(

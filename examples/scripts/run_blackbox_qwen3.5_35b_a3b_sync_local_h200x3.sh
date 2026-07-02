@@ -113,6 +113,8 @@ PROXY_ARGS=(
    --trajectory-build-model "${TRAJECTORY_BUILD_MODEL}"
    "${COMM_ARGS[@]}"
    --context-window "${CONTEXT_WINDOW}"
+   --tool-call-parse-backend "${TOOL_CALL_PARSE_BACKEND:-hybrid}"
+   --reasoning-parse-backend "${REASONING_PARSE_BACKEND:-hybrid}"
 )
 
 CKPT_ARGS=(

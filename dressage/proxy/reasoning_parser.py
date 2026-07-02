@@ -213,13 +213,15 @@ class ProxyReasoningParser:
                 )
             ) or ReasoningParseResult(reasoning_content=None, text=raw_text)
 
+        local_parser = get_local_reasoning_parser(self._model_reasoning_type)
+        if local_parser is not None:
+            profile_set(profile, "reasoning.parse.hybrid_local_first", 1.0)
+            with profile_span(profile, "reasoning.parse.hybrid_local_first_s"):
+                return local_parser(raw_text)
+
         parsed = await self._parse_with_sglang_api(
             raw_text, routing_key=routing_key, profile=profile
         )
         if parsed is not None:
             return parsed
-        local_parser = get_local_reasoning_parser(self._model_reasoning_type)
-        if local_parser is None:
-            return ReasoningParseResult(reasoning_content=None, text=raw_text)
-        with profile_span(profile, "reasoning.parse.hybrid_local_fallback_s"):
-            return local_parser(raw_text)
+        return ReasoningParseResult(reasoning_content=None, text=raw_text)

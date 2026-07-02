@@ -413,6 +413,17 @@ class ProxyToolCallParser:
                 )
             ) or (raw_text, None)
 
+        local_parser = self._resolve_local_parser()
+        if local_parser is not None:
+            profile_set(profile, "tool.parse.hybrid_local_first", 1.0)
+            local_content, local_tool_calls = self._parse_locally(
+                raw_text, profile=profile
+            )
+            if local_tool_calls:
+                return local_content, local_tool_calls
+            if local_content != raw_text:
+                return local_content, local_tool_calls
+
         parsed = await self._parse_with_sglang_api(
             raw_text, tools, routing_key=routing_key, profile=profile
         )
