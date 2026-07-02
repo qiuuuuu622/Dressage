@@ -1831,6 +1831,134 @@ def test_sglang_router_client_parse_function_call_retries_next_worker_after_fail
     assert attempted_ports == [30000, 30001]
 
 
+def test_sglang_router_client_parser_apis_reuse_cached_workers():
+    workers_calls = 0
+    parse_ports: list[int | None] = []
+    reasoning_ports: list[int | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal workers_calls
+        if request.url.path == "/workers":
+            workers_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "workers": [
+                        {
+                            "url": "http://127.0.0.1:30000",
+                            "is_healthy": True,
+                            "connection_mode": "Http",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/separate_reasoning":
+            reasoning_ports.append(request.url.port)
+            return httpx.Response(200, json={"reasoning_text": "plan", "text": "answer"})
+        if request.url.path == "/parse_function_call":
+            parse_ports.append(request.url.port)
+            return httpx.Response(
+                200,
+                json={
+                    "normal_text": "parsed",
+                    "calls": [{"name": "lookup", "parameters": {"q": "ok"}}],
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ) as client:
+            router = SGLangRouterClient(
+                "http://router.test",
+                client=client,
+                worker_cache_ttl_seconds=30.0,
+            )
+            reasoning = await router.separate_reasoning(
+                "raw",
+                reasoning_parser="qwen3",
+            )
+            parsed = await router.parse_function_call(
+                "raw",
+                tool_call_parser="qwen3_coder",
+                tools=make_tools("lookup"),
+            )
+            return reasoning, parsed
+
+    reasoning, parsed = asyncio.run(run_test())
+
+    assert workers_calls == 1
+    assert reasoning == {"reasoning_text": "plan", "text": "answer"}
+    assert parsed == {
+        "normal_text": "parsed",
+        "calls": [{"name": "lookup", "parameters": {"q": "ok"}}],
+    }
+    assert reasoning_ports == [30000]
+    assert parse_ports == [30000]
+
+
+def test_sglang_router_client_parser_cache_refreshes_after_cached_workers_fail():
+    workers_calls = 0
+    parse_ports: list[int | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal workers_calls
+        if request.url.path == "/workers":
+            workers_calls += 1
+            port = 30000 if workers_calls == 1 else 30001
+            return httpx.Response(
+                200,
+                json={
+                    "workers": [
+                        {
+                            "url": f"http://127.0.0.1:{port}",
+                            "is_healthy": True,
+                            "connection_mode": "Http",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/parse_function_call":
+            parse_ports.append(request.url.port)
+            if request.url.port == 30000:
+                return httpx.Response(503, json={"error": "stale worker"})
+            return httpx.Response(
+                200,
+                json={
+                    "normal_text": "parsed after refresh",
+                    "calls": [{"name": "lookup", "parameters": {"q": "ok"}}],
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ) as client:
+            router = SGLangRouterClient(
+                "http://router.test",
+                client=client,
+                worker_cache_ttl_seconds=30.0,
+            )
+            return await router.parse_function_call(
+                "raw",
+                tool_call_parser="qwen3_coder",
+                tools=make_tools("lookup"),
+            )
+
+    parsed = asyncio.run(run_test())
+
+    assert workers_calls == 2
+    assert parse_ports == [30000, 30001]
+    assert parsed == {
+        "normal_text": "parsed after refresh",
+        "calls": [{"name": "lookup", "parameters": {"q": "ok"}}],
+    }
+
+
 def test_sglang_router_client_separate_reasoning_uses_first_healthy_http_worker():
     observed_requests: list[dict[str, Any]] = []
 

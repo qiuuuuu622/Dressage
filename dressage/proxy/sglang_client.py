@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -157,6 +158,16 @@ def _coerce_bool(value: Any) -> bool:
     return False
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 class SGLangRouterClient:
     """HTTP client that forwards router affinity via ``X-SMG-Routing-Key``."""
 
@@ -167,6 +178,7 @@ class SGLangRouterClient:
         timeout: httpx.Timeout | None = None,
         client: httpx.AsyncClient | None = None,
         return_routed_experts: bool = False,
+        worker_cache_ttl_seconds: float | None = None,
     ):
         self._router_url = router_url.rstrip("/")
         self._owns_client = client is None
@@ -174,6 +186,14 @@ class SGLangRouterClient:
         self._client = client or httpx.AsyncClient(
             timeout=timeout or httpx.Timeout(None), trust_env=False
         )
+        if worker_cache_ttl_seconds is None:
+            worker_cache_ttl_seconds = _env_float(
+                "DRESSAGE_SGLANG_WORKER_CACHE_TTL_SEC", 10.0
+            )
+        self._worker_cache_ttl_seconds = max(0.0, float(worker_cache_ttl_seconds))
+        self._worker_cache: list[SGLangWorkerInfo] | None = None
+        self._worker_cache_expires_at = 0.0
+        self._worker_cache_lock = asyncio.Lock()
 
     async def generate(
         self,
@@ -370,6 +390,42 @@ class SGLangRouterClient:
             )
         return workers
 
+    def _worker_cache_valid(self) -> bool:
+        return (
+            self._worker_cache_ttl_seconds > 0
+            and self._worker_cache is not None
+            and time.monotonic() < self._worker_cache_expires_at
+        )
+
+    def _invalidate_worker_cache(self) -> None:
+        self._worker_cache = None
+        self._worker_cache_expires_at = 0.0
+
+    async def _list_workers_cached(
+        self,
+        *,
+        force_refresh: bool = False,
+        profile: dict[str, Any] | None = None,
+        profile_prefix: str = "sglang.workers",
+    ) -> list[SGLangWorkerInfo]:
+        if not force_refresh and self._worker_cache_valid():
+            profile_add(profile, f"{profile_prefix}.cache_hit", 1.0)
+            return list(self._worker_cache or [])
+
+        async with self._worker_cache_lock:
+            if not force_refresh and self._worker_cache_valid():
+                profile_add(profile, f"{profile_prefix}.cache_hit", 1.0)
+                return list(self._worker_cache or [])
+
+            profile_add(profile, f"{profile_prefix}.cache_refresh", 1.0)
+            workers = await self.list_workers()
+            if self._worker_cache_ttl_seconds > 0:
+                self._worker_cache = list(workers)
+                self._worker_cache_expires_at = (
+                    time.monotonic() + self._worker_cache_ttl_seconds
+                )
+            return workers
+
     @staticmethod
     def _candidate_workers(workers: list[SGLangWorkerInfo]) -> list[SGLangWorkerInfo]:
         return [
@@ -445,7 +501,10 @@ class SGLangRouterClient:
             async with async_profile_span(
                 profile, "sglang.parse_function_call.list_workers_s"
             ):
-                workers = await self.list_workers()
+                workers = await self._list_workers_cached(
+                    profile=profile,
+                    profile_prefix="sglang.parse_function_call.workers",
+                )
         except Exception:
             return None
 
@@ -488,6 +547,58 @@ class SGLangRouterClient:
                 normal_text = str(normal_text)
             return {"normal_text": normal_text, "calls": data.get("calls")}
 
+        if not self._worker_cache_valid():
+            return None
+
+        self._invalidate_worker_cache()
+        try:
+            async with async_profile_span(
+                profile, "sglang.parse_function_call.list_workers_refresh_s"
+            ):
+                workers = await self._list_workers_cached(
+                    force_refresh=True,
+                    profile=profile,
+                    profile_prefix="sglang.parse_function_call.workers",
+                )
+        except Exception:
+            return None
+
+        for worker in self._candidate_workers(workers):
+            payload = {
+                "text": text,
+                "tool_call_parser": parser_name,
+            }
+            if tools:
+                payload["tools"] = tools
+            try:
+                async with async_profile_span(
+                    profile, "sglang.parse_function_call.post_refresh_s"
+                ):
+                    response = await self._client.post(
+                        f"{worker.url}/parse_function_call",
+                        json=payload,
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                with profile_span(
+                    profile, "sglang.parse_function_call.json_parse_refresh_s"
+                ):
+                    data = response.json()
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+            if "normal_text" not in data or "calls" not in data:
+                continue
+            if not isinstance(data.get("calls"), list):
+                continue
+
+            normal_text = data.get("normal_text")
+            if normal_text is not None and not isinstance(normal_text, str):
+                normal_text = str(normal_text)
+            return {"normal_text": normal_text, "calls": data.get("calls")}
+
         return None
 
     async def separate_reasoning(
@@ -508,7 +619,10 @@ class SGLangRouterClient:
             async with async_profile_span(
                 profile, "sglang.separate_reasoning.list_workers_s"
             ):
-                workers = await self.list_workers()
+                workers = await self._list_workers_cached(
+                    profile=profile,
+                    profile_prefix="sglang.separate_reasoning.workers",
+                )
         except Exception:
             return None
 
@@ -533,6 +647,57 @@ class SGLangRouterClient:
                     )
                 response.raise_for_status()
                 with profile_span(profile, "sglang.separate_reasoning.json_parse_s"):
+                    data = response.json()
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+            if "text" not in data:
+                continue
+            reasoning_text = data.get("reasoning_text", data.get("reasoning_content"))
+            if reasoning_text is not None and not isinstance(reasoning_text, str):
+                reasoning_text = str(reasoning_text)
+            visible_text = data.get("text")
+            if visible_text is not None and not isinstance(visible_text, str):
+                visible_text = str(visible_text)
+            return {"reasoning_text": reasoning_text, "text": visible_text}
+
+        if not self._worker_cache_valid():
+            return None
+
+        self._invalidate_worker_cache()
+        try:
+            async with async_profile_span(
+                profile, "sglang.separate_reasoning.list_workers_refresh_s"
+            ):
+                workers = await self._list_workers_cached(
+                    force_refresh=True,
+                    profile=profile,
+                    profile_prefix="sglang.separate_reasoning.workers",
+                )
+        except Exception:
+            return None
+
+        for worker in self._candidate_workers(workers):
+            payload = {
+                "text": text,
+                "reasoning_parser": parser_name,
+            }
+
+            try:
+                async with async_profile_span(
+                    profile, "sglang.separate_reasoning.post_refresh_s"
+                ):
+                    response = await self._client.post(
+                        f"{worker.url}/separate_reasoning",
+                        json=payload,
+                        headers=headers,
+                    )
+                response.raise_for_status()
+                with profile_span(
+                    profile, "sglang.separate_reasoning.json_parse_refresh_s"
+                ):
                     data = response.json()
             except Exception:
                 continue
